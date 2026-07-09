@@ -1,0 +1,15 @@
+# Kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Compiled test binaries
+test/vmem_test
+test/vmem_gpu_test
