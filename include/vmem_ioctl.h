@@ -1,21 +1,27 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
- * vmem_ioctl.h - vMem driver UAPI: shared by kernel module and userspace
+ * vmem_ioctl.h - vMem driver UAPI (v1.0)
  *
- * vMem acts as a dma-buf translator for cross-node GPU P2P over PCIe switch.
+ * Producer (local GPU owner):
+ *   VMEM_IOCTL_GET_PFN_OFFSET_LIST  -- attach GPU dma-buf, extract BAR offsets
+ *   VMEM_IOCTL_PUT_IPC_FD           -- release persistent pin for one dma-buf
  *
- * Producer side (local GPU owner):
- *   VMEM_IOCTL_GET_PFN_OFFSET_LIST  -- parse real dma-buf, return PFN offsets
- *   VMEM_IOCTL_PUT_IPC_FD           -- release exported GPU address info
+ * Consumer (remote GPU importer):
+ *   VMEM_IOCTL_GET_IPC_FD           -- build fake dma-buf from offset list
  *
- * Consumer side (remote GPU importer):
- *   VMEM_IOCTL_GET_IPC_FD           -- build fake dma-buf from PFN offsets
- *   VMEM_IOCTL_CLOSE_IPC_FD         -- destroy the fake dma-buf
+ * Utilities:
+ *   VMEM_IOCTL_VERSION              -- query driver version
+ *   VMEM_IOCTL_IDENTIFY_DMABUF     -- probe which GPU owns a dma-buf
  *
- * Endpoint registration (PCIe SW driver / daemon):
- *   VMEM_IOCTL_REGISTER_EP          -- register local PCIe endpoint BAR2
+ * Changes from v0.1:
+ *   - pfn_list no longer embedded in ioctl args (userspace pointer instead)
+ *   - GET_IPC_FD takes consumer_bus/device/function (no REGISTER_EP needed)
+ *   - CLOSE_IPC_FD removed: call close(fd) from userspace
+ *   - REGISTER_EP removed: consumer BDF now per-call
+ *   - ABS_PFN flag for direct-addressable fabrics
+ *   - Dynamic entry count (ENOSPC + retry)
+ *   - _IOWR encoding with proper struct sizes
  */
-
 #ifndef _UAPI_VMEM_IOCTL_H
 #define _UAPI_VMEM_IOCTL_H
 
@@ -25,18 +31,28 @@
 #else
 #include <stdint.h>
 #include <sys/ioctl.h>
-#include <asm/types.h>  /* __u8 __u16 __u32 __u64 __s32 */
+#include <asm/types.h>
 #endif
 
 #define VMEM_MAGIC 'V'
 
-/* Maximum number of scatter entries per buffer */
+#define VMEM_DRV_VERSION_MAJOR 1
+#define VMEM_DRV_VERSION_MINOR 0
+#define VMEM_DRV_VERSION_PATCH 0
+
+/* Recommended userspace buffer size for pfn_entries[] (not a hard kernel limit) */
 #define VMEM_MAX_PFN_ENTRIES 4096
 
+/* Flags for VMEM_IOCTL_GET_PFN_OFFSET_LIST */
+#define VMEM_GET_PFN_FLAG_ABS_PA  (1 << 0)  /* return absolute physical addr instead of BAR-relative offset */
+
+/* Flags for VMEM_IOCTL_GET_IPC_FD */
+#define VMEM_IPC_FLAG_ABS_PA      (1 << 0)  /* entries contain absolute physical addresses */
+
 /**
- * struct vmem_pfn_entry - single scatter-list entry for cross-node transfer
- * @offset: byte offset of this chunk from GPU BAR2 base address
- * @size:   byte length of this chunk (must be page-aligned)
+ * struct vmem_pfn_entry - one scatter entry for cross-node PFN transport
+ * @offset: BAR2-relative byte offset (or absolute physical addr if ABS_PA flag)
+ * @size:   byte length of this scatter chunk (page-aligned)
  */
 struct vmem_pfn_entry {
 	__u64 offset;
@@ -44,66 +60,60 @@ struct vmem_pfn_entry {
 	__u32 pad;
 };
 
-/**
- * struct vmem_pfn_list - ordered list of PFN scatter entries for one buffer
- * @count:   number of valid entries
- * @entries: scatter entries
- */
-struct vmem_pfn_list {
-	__u32 count;
-	__u32 pad;
-	struct vmem_pfn_entry entries[VMEM_MAX_PFN_ENTRIES];
-};
+/* ── IOCTL argument structures ───────────────────────────── */
 
-/* -- IOCTL argument structures -------------------- */
+/**
+ * struct vmem_ioctl_version_arg - VMEM_IOCTL_VERSION
+ */
+struct vmem_ioctl_version_arg {
+	__u16 major;
+	__u16 minor;
+	__u16 patch;
+	__u16 reserved;
+};
 
 /**
  * struct vmem_ioctl_get_pfn_arg - VMEM_IOCTL_GET_PFN_OFFSET_LIST
  *
- * Producer calls this to extract PFN offsets from a real dma-buf fd.
- * The driver attaches to the dma-buf via the GPU identified by (bus,dev,fn),
- * maps the scatter list, computes offset = dma_addr - GPU_BAR2_base for each
- * entry, and returns the offset list to userspace.
+ * Producer: attach to GPU dma-buf, extract BAR-relative scatter offsets.
+ * @count IN = capacity of entries_ptr[]; OUT = actual entry count.
+ * Returns -ENOSPC (with count = required) if buffer too small → retry.
+ * Driver keeps attachment alive until PUT_IPC_FD or vmem fd close.
  */
 struct vmem_ioctl_get_pfn_arg {
-	__s32 fd;         /* in:  dma-buf fd from zeMemGetIpcHandle */
-	__u8  bus;        /* in:  GPU PCIe bus number               */
-	__u8  device;     /* in:  GPU PCIe device number            */
-	__u8  function;   /* in:  GPU PCIe function number          */
-	__u8  pad;
-	struct vmem_pfn_list pfn_list; /* out: PFN offset list     */
+	__s32  fd;           /* in:  GPU dma-buf fd (from zeMemGetIpcHandle) */
+	__u8   bus;          /* in:  GPU PCIe bus */
+	__u8   device;       /* in:  GPU PCIe device */
+	__u8   function;     /* in:  GPU PCIe function */
+	__u8   flags;        /* in:  VMEM_GET_PFN_FLAG_* */
+	__u32  count;        /* in/out: capacity / actual entry count */
+	__u32  pad;
+	__u64  entries_ptr;  /* in:  userspace ptr → vmem_pfn_entry[] output buffer */
 };
 
 /**
  * struct vmem_ioctl_get_ipc_fd_arg - VMEM_IOCTL_GET_IPC_FD
  *
- * Consumer calls this to create a "fake" dma-buf from received PFN offsets.
- * The driver translates each offset through the registered local endpoint
- * BAR2 base (offset + ep_bar2_base = local physical address), assembles a
- * synthetic dma-buf, exports it, and returns the fd.
+ * Consumer: build a fake dma-buf from received scatter entries.
+ * consumer_bus/device/function: the local GPU that will import this buffer.
+ * Driver resolves consumer BAR2 base via pci_resource_start().
  */
 struct vmem_ioctl_get_ipc_fd_arg {
-	struct vmem_pfn_list pfn_list; /* in:  PFN list from producer */
-	__s32 fd;                      /* out: fake dma-buf fd        */
-	__u32 pad;
-};
-
-/**
- * struct vmem_ioctl_close_ipc_fd_arg - VMEM_IOCTL_CLOSE_IPC_FD
- *
- * Consumer calls this to destroy the fake dma-buf and release resources.
- * Equivalent to close(fd) on the fake dma-buf fd.
- */
-struct vmem_ioctl_close_ipc_fd_arg {
-	__s32 fd;
-	__u32 pad;
+	__u8   consumer_bus;       /* in:  consumer GPU PCIe bus */
+	__u8   consumer_device;    /* in:  consumer GPU PCIe device */
+	__u8   consumer_function;  /* in:  consumer GPU PCIe function */
+	__u8   flags;              /* in:  VMEM_IPC_FLAG_* */
+	__u32  count;              /* in:  number of entries in entries_ptr[] */
+	__u64  entries_ptr;        /* in:  userspace ptr → vmem_pfn_entry[] from producer */
+	__s32  fd;                 /* out: fake dma-buf fd */
+	__u32  pad;
 };
 
 /**
  * struct vmem_ioctl_put_ipc_fd_arg - VMEM_IOCTL_PUT_IPC_FD
  *
- * Producer calls this to release any reference the driver holds on the
- * original dma-buf fd after GET_PFN_OFFSET_LIST.
+ * Release the persistent dma-buf attachment kept since GET_PFN_OFFSET_LIST.
+ * @fd: the original GPU dma-buf fd passed to GET_PFN_OFFSET_LIST.
  */
 struct vmem_ioctl_put_ipc_fd_arg {
 	__s32 fd;
@@ -111,27 +121,44 @@ struct vmem_ioctl_put_ipc_fd_arg {
 };
 
 /**
- * struct vmem_ioctl_register_ep_arg - VMEM_IOCTL_REGISTER_EP
+ * struct vmem_ioctl_identify_dmabuf_arg - VMEM_IOCTL_IDENTIFY_DMABUF
  *
- * PCIe SW driver / daemon calls this to register the local virtual/physical
- * PCIe endpoint that maps to the remote GPU VRAM via the L2 switch.
- * If bar2_base == 0 the driver auto-detects BAR2 from the BDF.
+ * Probe which GPU's VRAM backs a dma-buf: temporary attach via @bus/@device/@function,
+ * read first DMA address, scan PCI BARs, return source GPU BDF.
  */
-struct vmem_ioctl_register_ep_arg {
-	__u8  bus;
-	__u8  device;
-	__u8  function;
-	__u8  pad;
-	__u32 pad2;
-	__u64 bar2_base; /* physical address; 0 = auto-detect from BDF */
-	__u64 bar2_size; /* BAR2 window size in bytes                  */
+struct vmem_ioctl_identify_dmabuf_arg {
+	__s32  fd;               /* in:  dma-buf fd to probe */
+	__u8   bus;              /* in:  PCI bus for temporary attach */
+	__u8   device;           /* in:  PCI device */
+	__u8   function;         /* in:  PCI function */
+	__u8   pad;
+	__u8   source_bus;       /* out: source GPU bus */
+	__u8   source_device;    /* out: source GPU device */
+	__u8   source_function;  /* out: source GPU function */
+	__u8   pad2;
 };
 
-/* -- IOCTL command codes -------------------- */
+/* ── IOCTL commands ──────────────────────────────────────── */
 
-#define VMEM_IOCTL_GET_PFN_OFFSET_LIST	_IO(VMEM_MAGIC, 0x01)
+#define VMEM_IOCTL_VERSION \
+	_IOR(VMEM_MAGIC, 0x00, struct vmem_ioctl_version_arg)
 
-#define VMEM_IOCTL_GET_IPC_FD		_IO(VMEM_MAGIC, 0x02)
+#define VMEM_IOCTL_GET_PFN_OFFSET_LIST \
+	_IOWR(VMEM_MAGIC, 0x01, struct vmem_ioctl_get_pfn_arg)
+
+#define VMEM_IOCTL_GET_IPC_FD \
+	_IOWR(VMEM_MAGIC, 0x02, struct vmem_ioctl_get_ipc_fd_arg)
+
+/**
+ * struct vmem_ioctl_close_ipc_fd_arg - VMEM_IOCTL_CLOSE_IPC_FD
+ *
+ * Consumer calls this to destroy the fake dma-buf and release kernel resources.
+ * The driver closes the fd on behalf of the caller via close_fd().
+ */
+struct vmem_ioctl_close_ipc_fd_arg {
+	__s32 fd;
+	__u32 pad;
+};
 
 #define VMEM_IOCTL_CLOSE_IPC_FD \
 	_IOW(VMEM_MAGIC, 0x03, struct vmem_ioctl_close_ipc_fd_arg)
@@ -139,12 +166,9 @@ struct vmem_ioctl_register_ep_arg {
 #define VMEM_IOCTL_PUT_IPC_FD \
 	_IOW(VMEM_MAGIC, 0x04, struct vmem_ioctl_put_ipc_fd_arg)
 
-#define VMEM_IOCTL_REGISTER_EP \
-	_IOW(VMEM_MAGIC, 0x05, struct vmem_ioctl_register_ep_arg)
+/* 0x05: VMEM_IOCTL_REGISTER_EP removed — consumer BDF now per-call in GET_IPC_FD */
 
-/* -- Return codes -------------------- */
-#define BMEMLINK_OK    0
-#define BMEMLINK_ERROR (-1)
+#define VMEM_IOCTL_IDENTIFY_DMABUF \
+	_IOWR(VMEM_MAGIC, 0x06, struct vmem_ioctl_identify_dmabuf_arg)
 
 #endif /* _UAPI_VMEM_IOCTL_H */
-
