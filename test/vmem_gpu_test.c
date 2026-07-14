@@ -181,7 +181,8 @@ int main(void)
     void   *gpu0_buf  = NULL;    /* GPU0 VRAM allocation */
     void   *gpu1_import = NULL;  /* GPU1 imported pointer (P2P test) */
     void   *host_verify = NULL;  /* host buffer for readback */
-    struct vmem_pfn_entry *pfn_entries = NULL;
+    struct vmem_pfn_entry *pfn_entries = NULL; /* BAR-relative offsets from vmem */
+    struct vmem_pfn_entry *pa_entries  = NULL; /* absolute PAs computed by daemon */
     ze_ipc_mem_handle_t ipc0      = {};
     int     dma_fd    = -1;
     int     vmem_fd   = -1;
@@ -297,21 +298,17 @@ int main(void)
     }
     printf(PASS " Opened %s (fd=%d)\n", VMEM_DEV, vmem_fd);
 
-    /* Verify driver version */
-    {
-        struct vmem_ioctl_version_arg ver = {};
-        if (ioctl(vmem_fd, VMEM_IOCTL_VERSION, &ver) == 0)
-            printf(PASS " vmem driver v%u.%u.%u\n",
-                   ver.major, ver.minor, ver.patch);
-        else
-            printf(WARN " VMEM_IOCTL_VERSION failed: %s\n", strerror(errno));
-    }
+    { struct vmem_ioctl_version_arg ver = {};
+      if (ioctl(vmem_fd, VMEM_IOCTL_VERSION, &ver) == 0)
+          printf(PASS " vmem driver v%u.%u.%u\n", ver.major, ver.minor, ver.patch);
+      else printf(WARN " VMEM_IOCTL_VERSION failed: %s\n", strerror(errno)); }
 
-    /* Phase 6: REGISTER_EP removed — consumer BDF is now per-call in GET_IPC_FD */
-    printf(BOLD "\n[Phase 6] (skipped: consumer BDF %02x:%02x.%x passed directly to GET_IPC_FD)\n" RST,
-           GPU1_BUS, GPU1_DEV, GPU1_FN);
+    /* ======================================================================
+     * Phase 6: daemon role — allocate PFN entry buffer (no REGISTER_EP)
+     * PA = vFE_bar_base + scatter_offset is computed by daemon in userspace.
+     * ==================================================================== */
+    printf(BOLD "\n[Phase 6] (daemon: PA = vFE_bar_base + scatter_offset)\n" RST);
 
-    /* Allocate userspace pfn entry buffer */
     pfn_entries = calloc(VMEM_MAX_PFN_ENTRIES, sizeof(*pfn_entries));
     if (!pfn_entries) {
         fprintf(stderr, FAIL " calloc pfn_entries failed\n");
@@ -328,11 +325,9 @@ int main(void)
         .bus         = GPU0_BUS,
         .device      = GPU0_DEV,
         .function    = GPU0_FN,
-        .flags       = 0,
         .count       = VMEM_MAX_PFN_ENTRIES,
         .entries_ptr = (uint64_t)(uintptr_t)pfn_entries,
     };
-
     IOCTL_CHECK(vmem_fd, VMEM_IOCTL_GET_PFN_OFFSET_LIST, &pfn_arg);
     printf(PASS " Got %u PFN entries from GPU0 dma-buf\n", pfn_arg.count);
 
@@ -378,15 +373,30 @@ int main(void)
      * ==================================================================== */
     printf(BOLD "\n[Phase 9] GET_IPC_FD (build fake dma-buf for GPU1)\n" RST);
 
-    struct vmem_ioctl_get_ipc_fd_arg ipc_arg = {
-        .consumer_bus      = GPU1_BUS,
-        .consumer_device   = GPU1_DEV,
-        .consumer_function = GPU1_FN,
-        .flags             = 0,
-        .count             = pfn_arg.count,
-        .entries_ptr       = (uint64_t)(uintptr_t)pfn_entries,
-    };
+    /*
+     * Daemon role: synthesise absolute PAs.
+     *   PA = vFE_bar_base + scatter_offset
+     * Production: vFE_bar_base from Astera SDK / vFE driver.
+     * Test (single-machine): GPU1_BAR2_BASE as stand-in.
+     */
+    pa_entries = calloc(pfn_arg.count, sizeof(*pa_entries));
+    if (!pa_entries) {
+        fprintf(stderr, FAIL " calloc pa_entries failed\n");
+        goto cleanup;
+    }
+    for (uint32_t i = 0; i < pfn_arg.count; i++) {
+        pa_entries[i].offset = GPU1_BAR2_BASE + pfn_entries[i].offset;
+        pa_entries[i].size   = pfn_entries[i].size;
+        printf(INFO " pa[%u]: 0x%llx + 0x%llx = 0x%llx\n", i,
+               (unsigned long long)GPU1_BAR2_BASE,
+               (unsigned long long)pfn_entries[i].offset,
+               (unsigned long long)pa_entries[i].offset);
+    }
 
+    struct vmem_ioctl_get_ipc_fd_arg ipc_arg = {
+        .count       = pfn_arg.count,
+        .entries_ptr = (uint64_t)(uintptr_t)pa_entries,
+    };
     IOCTL_CHECK(vmem_fd, VMEM_IOCTL_GET_IPC_FD, &ipc_arg);
     fake_fd = ipc_arg.fd;
 
@@ -558,7 +568,8 @@ cleanup:
         printf(INFO " GPU0 buffer freed\n");
     }
 
-    if (pfn_entries) free(pfn_entries);
+    if (pfn_entries) { free(pfn_entries); pfn_entries = NULL; }
+    if (pa_entries)  { free(pa_entries);  pa_entries  = NULL; }
     if (vmem_fd >= 0) close(vmem_fd);
     if (ctx) zeContextDestroy(ctx);
 

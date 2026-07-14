@@ -12,16 +12,12 @@
 /**
  * struct vmem_buf - internal context for a consumer-side fake dma-buf
  * @nr_entries:    number of scatter entries
- * @ep_bar2_base:  consumer GPU BAR2 physical base (0 when abs_pa)
  * @total_size:    total byte size of the buffer
- * @abs_pa:        true when entries[].offset are absolute physical addresses
- * @entries:       kvmalloc'd scatter entry array; freed in vmem_dmabuf_release
+ * @entries:       kvmalloc'd array; entries[i].offset = absolute PA (from daemon)
  */
 struct vmem_buf {
 	unsigned int          nr_entries;
-	phys_addr_t           ep_bar2_base;
 	size_t                total_size;
-	bool                  abs_pa;
 	struct vmem_pfn_entry *entries;
 };
 
@@ -49,15 +45,13 @@ struct vmem_file_priv {
 int vmem_parse_dmabuf(struct vmem_file_priv *priv,
 		      int dmabuf_fd,
 		      u8 bus, u8 pci_dev, u8 fn,
-		      u8 flags,
 		      struct vmem_pfn_entry __user *entries_ptr,
 		      u32 *count);
 
 /* Consumer side */
+/* entries_ptr[i].offset must be absolute physical addresses (daemon computes PA). */
 struct dma_buf *vmem_create_dmabuf(struct vmem_pfn_entry __user *entries_ptr,
-				   u32 count,
-				   u8 consumer_bus, u8 consumer_dev,
-				   u8 consumer_fn, u8 flags);
+				   u32 count);
 
 /* Source detection */
 int vmem_identify_dmabuf_source(int fd,

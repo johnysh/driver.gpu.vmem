@@ -15,7 +15,7 @@
  *
  * Changes from v0.1:
  *   - pfn_list no longer embedded in ioctl args (userspace pointer instead)
- *   - GET_IPC_FD takes consumer_bus/device/function (no REGISTER_EP needed)
+ *   - GET_IPC_FD takes PA list from daemon (no BDF or BAR lookup in kernel)
  *   - CLOSE_IPC_FD removed: call close(fd) from userspace
  *   - REGISTER_EP removed: consumer BDF now per-call
  *   - ABS_PFN flag for direct-addressable fabrics
@@ -43,15 +43,14 @@
 /* Recommended userspace buffer size for pfn_entries[] (not a hard kernel limit) */
 #define VMEM_MAX_PFN_ENTRIES 4096
 
-/* Flags for VMEM_IOCTL_GET_PFN_OFFSET_LIST */
-#define VMEM_GET_PFN_FLAG_ABS_PA  (1 << 0)  /* return absolute physical addr instead of BAR-relative offset */
-
-/* Flags for VMEM_IOCTL_GET_IPC_FD */
-#define VMEM_IPC_FLAG_ABS_PA      (1 << 0)  /* entries contain absolute physical addresses */
+/* GET_PFN_OFFSET_LIST always returns BAR2-relative offsets.
+ * PA computation (offset + vFE_bar_base) is done by the daemon in userspace. */
 
 /**
  * struct vmem_pfn_entry - one scatter entry for cross-node PFN transport
- * @offset: BAR2-relative byte offset (or absolute physical addr if ABS_PA flag)
+ * @offset: producer side: BAR2-relative byte offset from GPU VRAM base
+ *          consumer side: absolute physical address (= vFE_bar_base + offset,
+ *                         computed by daemon using Astera vFE driver)
  * @size:   byte length of this scatter chunk (page-aligned)
  */
 struct vmem_pfn_entry {
@@ -85,7 +84,7 @@ struct vmem_ioctl_get_pfn_arg {
 	__u8   bus;          /* in:  GPU PCIe bus */
 	__u8   device;       /* in:  GPU PCIe device */
 	__u8   function;     /* in:  GPU PCIe function */
-	__u8   flags;        /* in:  VMEM_GET_PFN_FLAG_* */
+	__u8   pad2;         /* reserved, must be zero */
 	__u32  count;        /* in/out: capacity / actual entry count */
 	__u32  pad;
 	__u64  entries_ptr;  /* in:  userspace ptr → vmem_pfn_entry[] output buffer */
@@ -94,19 +93,24 @@ struct vmem_ioctl_get_pfn_arg {
 /**
  * struct vmem_ioctl_get_ipc_fd_arg - VMEM_IOCTL_GET_IPC_FD
  *
- * Consumer: build a fake dma-buf from received scatter entries.
- * consumer_bus/device/function: the local GPU that will import this buffer.
- * Driver resolves consumer BAR2 base via pci_resource_start().
+ * Consumer: build a fake dma-buf from a list of absolute physical addresses.
+ *
+ * The daemon is responsible for PA synthesis:
+ *   PA = vFE_bar_base + scatter_offset
+ * where vFE_bar_base is obtained from the Astera vFE driver and
+ * scatter_offset comes from VMEM_IOCTL_GET_PFN_OFFSET_LIST.
+ *
+ * The vmem driver receives ready-to-use physical addresses and builds the
+ * synthetic dma-buf — no BDF or BAR lookup needed in the kernel.
  */
 struct vmem_ioctl_get_ipc_fd_arg {
-	__u8   consumer_bus;       /* in:  consumer GPU PCIe bus */
-	__u8   consumer_device;    /* in:  consumer GPU PCIe device */
-	__u8   consumer_function;  /* in:  consumer GPU PCIe function */
-	__u8   flags;              /* in:  VMEM_IPC_FLAG_* */
-	__u32  count;              /* in:  number of entries in entries_ptr[] */
-	__u64  entries_ptr;        /* in:  userspace ptr → vmem_pfn_entry[] from producer */
-	__s32  fd;                 /* out: fake dma-buf fd */
+	__u32  count;        /* in:  number of PA entries in entries_ptr[] */
 	__u32  pad;
+	__u64  entries_ptr;  /* in:  userspace ptr → vmem_pfn_entry[]
+	                        entries[i].offset = absolute physical address
+	                        (daemon: vFE_bar_base + scatter_offset) */
+	__s32  fd;           /* out: fake dma-buf fd */
+	__u32  pad2;
 };
 
 /**

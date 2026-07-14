@@ -3,9 +3,9 @@
  * vmem_dmabuf.c - vMem dma-buf parse (producer) and assemble (consumer)
  *
  * v1.0 changes:
- *   - vmem_parse_dmabuf: userspace ptr output, ABS_PA flag, dynamic count,
- *     persistent pin via vmem_import_pin (no immediate unmap)
- *   - vmem_create_dmabuf: consumer BDF per-call (no REGISTER_EP), ABS_PA flag
+ *   - vmem_parse_dmabuf: userspace ptr output, dynamic count,
+ *     persistent pin via vmem_import_pin; always returns BAR-relative offsets
+ *   - vmem_create_dmabuf: takes PA list from daemon (no BDF/BAR in kernel)
  *   - vmem_identify_dmabuf_source: new — temporary attach + BAR scan
  *   - vmem_buf.entries: dynamically allocated (no fixed VMEM_MAX_PFN_ENTRIES limit)
  */
@@ -50,8 +50,8 @@ static const struct dma_buf_attach_ops vmem_importer_ops = {
  * @priv:        per-fd state (for pin storage)
  * @dmabuf_fd:   GPU dma-buf fd (from zeMemGetIpcHandle)
  * @bus/fn:      GPU PCI BDF
- * @flags:       VMEM_GET_PFN_FLAG_ABS_PA → store absolute physical addr in offset
  * @entries_ptr: userspace output buffer for vmem_pfn_entry[]
+ *               entries[i].offset = BAR2-relative byte offset from GPU VRAM base
  * @count:       IN = buffer capacity; OUT = actual entry count
  *
  * Returns 0, -ENOSPC (with *count = required), or negative error.
@@ -59,7 +59,6 @@ static const struct dma_buf_attach_ops vmem_importer_ops = {
 int vmem_parse_dmabuf(struct vmem_file_priv *priv,
 		      int dmabuf_fd,
 		      u8 bus, u8 pci_devno, u8 fn,
-		      u8 flags,
 		      struct vmem_pfn_entry __user *entries_ptr,
 		      u32 *count)
 {
@@ -68,7 +67,6 @@ int vmem_parse_dmabuf(struct vmem_file_priv *priv,
 	struct dma_buf_attachment *attach = NULL;
 	struct sg_table *sgt = NULL;
 	phys_addr_t bar2_base = 0;
-	bool abs_pa = !!(flags & VMEM_GET_PFN_FLAG_ABS_PA);
 	struct vmem_pfn_entry *kentries = NULL;
 	u32 capacity = *count;
 	u32 nr_entries;
@@ -81,16 +79,14 @@ int vmem_parse_dmabuf(struct vmem_file_priv *priv,
 		return -ENODEV;
 	}
 
-	if (!abs_pa) {
-		bar2_base = pci_resource_start(pdev, 2);
-		if (!bar2_base) {
-			pr_err("vmem: GPU BAR2 not available for %02x:%02x.%x\n",
-			       bus, pci_devno, fn);
-			ret = -ENXIO;
-			goto put_pdev;
-		}
-		pr_debug("vmem: GPU BAR2 base = 0x%llx\n", (u64)bar2_base);
+	bar2_base = pci_resource_start(pdev, 2);
+	if (!bar2_base) {
+		pr_err("vmem: GPU BAR2 not available for %02x:%02x.%x\n",
+		       bus, pci_devno, fn);
+		ret = -ENXIO;
+		goto put_pdev;
 	}
+	pr_debug("vmem: GPU BAR2 base = 0x%llx\n", (u64)bar2_base);
 
 	dmabuf = dma_buf_get(dmabuf_fd);
 	if (IS_ERR(dmabuf)) {
@@ -157,23 +153,22 @@ int vmem_parse_dmabuf(struct vmem_file_priv *priv,
 		dma_addr_t dma_addr = sg_dma_address(sg);
 		u32 size = (u32)sg_dma_len(sg);
 
-		if (!abs_pa && dma_addr < bar2_base) {
+		if (dma_addr < bar2_base) {
 			pr_err("vmem: sg[%d] dma_addr 0x%llx < BAR2 0x%llx\n",
 			       i, (u64)dma_addr, (u64)bar2_base);
 			ret = -EINVAL;
 			goto free_kentries;
 		}
 
-		kentries[i].offset = abs_pa ? (u64)dma_addr
-					    : (u64)(dma_addr - bar2_base);
+		kentries[i].offset = (u64)(dma_addr - bar2_base); /* BAR-relative */
 		kentries[i].size   = size;
 		kentries[i].pad    = 0;
 		pr_debug("vmem: sg[%d]: offset=0x%llx size=%u\n",
 			 i, kentries[i].offset, size);
 	}
 
-	pr_info("vmem: parsed %u entries from fd=%d (abs_pa=%d bar2=0x%llx)\n",
-		nr_entries, dmabuf_fd, abs_pa, (u64)bar2_base);
+	pr_info("vmem: parsed %u BAR-relative entries from fd=%d (bar2=0x%llx)\n",
+		nr_entries, dmabuf_fd, (u64)bar2_base);
 
 	/* Copy to userspace before storing the pin */
 	if (copy_to_user(entries_ptr, kentries,
@@ -248,10 +243,8 @@ static struct sg_table *vmem_dmabuf_map(struct dma_buf_attachment *attach,
 
 	sg = sgt->sgl;
 	for (i = 0; i < vbuf->nr_entries; i++, sg = sg_next(sg)) {
-		phys_addr_t phys = vbuf->abs_pa
-			? (phys_addr_t)vbuf->entries[i].offset
-			: (vbuf->ep_bar2_base +
-			   (phys_addr_t)vbuf->entries[i].offset);
+		/* entries[i].offset = absolute PA (daemon: vFE_bar_base + scatter_offset) */
+		phys_addr_t phys = (phys_addr_t)vbuf->entries[i].offset;
 		size_t sz  = vbuf->entries[i].size;
 		dma_addr_t dma;
 
@@ -338,10 +331,7 @@ static int vmem_dmabuf_mmap(struct dma_buf *dmabuf,
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
 	for (i = 0; i < vbuf->nr_entries; i++) {
-		phys_addr_t phys = vbuf->abs_pa
-			? (phys_addr_t)vbuf->entries[i].offset
-			: (vbuf->ep_bar2_base +
-			   (phys_addr_t)vbuf->entries[i].offset);
+		phys_addr_t phys = (phys_addr_t)vbuf->entries[i].offset; /* absolute PA */
 		size_t sz = vbuf->entries[i].size;
 
 		ret = io_remap_pfn_range(vma, vaddr, phys >> PAGE_SHIFT,
@@ -379,19 +369,16 @@ static const struct dma_buf_ops vmem_dmabuf_ops = {
 };
 
 /**
- * vmem_create_dmabuf - build a fake dma-buf from received scatter entries
+ * vmem_create_dmabuf - build a fake dma-buf from a physical address list
  *
- * Resolves consumer GPU BAR2 from @consumer_bus/dev/fn and maps each
- * entry as: phys = bar2_base + entry.offset (or entry.offset if ABS_PA).
+ * @entries_ptr: entries[i].offset must be absolute physical addresses.
+ *               The daemon computes PA = vFE_bar_base + scatter_offset using
+ *               the Astera vFE driver before calling this ioctl.
+ *               The vmem driver maps each PA directly — no BDF or BAR lookup.
  */
 struct dma_buf *vmem_create_dmabuf(struct vmem_pfn_entry __user *entries_ptr,
-				   u32 count,
-				   u8 consumer_bus, u8 consumer_dev,
-				   u8 consumer_fn, u8 flags)
+				   u32 count)
 {
-	struct pci_dev *pdev;
-	phys_addr_t bar2_base = 0;
-	bool abs_pa = !!(flags & VMEM_IPC_FLAG_ABS_PA);
 	struct vmem_buf *vbuf;
 	struct vmem_pfn_entry *kentries;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
@@ -402,26 +389,6 @@ struct dma_buf *vmem_create_dmabuf(struct vmem_pfn_entry __user *entries_ptr,
 	if (!count) {
 		pr_err("vmem: GET_IPC_FD: count=0\n");
 		return ERR_PTR(-EINVAL);
-	}
-
-	if (!abs_pa) {
-		pdev = pci_get_domain_bus_and_slot(
-			0, consumer_bus, PCI_DEVFN(consumer_dev, consumer_fn));
-		if (!pdev) {
-			pr_err("vmem: consumer GPU %02x:%02x.%x not found\n",
-			       consumer_bus, consumer_dev, consumer_fn);
-			return ERR_PTR(-ENODEV);
-		}
-		bar2_base = pci_resource_start(pdev, 2);
-		if (!bar2_base)
-			bar2_base = pci_resource_start(pdev, 0);
-		pci_dev_put(pdev);
-
-		if (!bar2_base) {
-			pr_err("vmem: consumer GPU has no BAR2/BAR0\n");
-			return ERR_PTR(-ENXIO);
-		}
-		pr_debug("vmem: consumer BAR2 base = 0x%llx\n", (u64)bar2_base);
 	}
 
 	kentries = kvcalloc(count, sizeof(*kentries), GFP_KERNEL);
@@ -443,10 +410,8 @@ struct dma_buf *vmem_create_dmabuf(struct vmem_pfn_entry __user *entries_ptr,
 	}
 
 	vbuf->nr_entries   = count;
-	vbuf->ep_bar2_base = bar2_base;
 	vbuf->total_size   = total;
-	vbuf->abs_pa       = abs_pa;
-	vbuf->entries      = kentries; /* ownership transferred to vbuf */
+	vbuf->entries      = kentries; /* entries[i].offset = absolute PA */ /* ownership transferred to vbuf */
 
 	exp_info.ops   = &vmem_dmabuf_ops;
 	exp_info.size  = total;
@@ -461,8 +426,8 @@ struct dma_buf *vmem_create_dmabuf(struct vmem_pfn_entry __user *entries_ptr,
 		return dmabuf;
 	}
 
-	pr_info("vmem: fake dma_buf created: %u entries %zu bytes abs_pa=%d\n",
-		count, total, abs_pa);
+	pr_info("vmem: fake dma_buf created: %u entries %zu bytes (PA from daemon)\n",
+		count, total);
 	return dmabuf;
 }
 

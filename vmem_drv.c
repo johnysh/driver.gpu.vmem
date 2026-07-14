@@ -5,7 +5,7 @@
  * Changes from v0.1:
  *   - REGISTER_EP / CLOSE_IPC_FD removed
  *   - GET_IPC_FD: consumer BDF per-call (no global ep_table)
- *   - GET_PFN_OFFSET_LIST: userspace pointer, dynamic count, ABS_PA flag
+ *   - GET_PFN_OFFSET_LIST: userspace pointer, dynamic count; always BAR-relative
  *   - VERSION + IDENTIFY_DMABUF added
  */
 
@@ -55,7 +55,6 @@ static long vmem_ioctl_get_pfn(struct file *filp, unsigned long arg)
 	ret = vmem_parse_dmabuf(priv,
 				karg.fd,
 				karg.bus, karg.device, karg.function,
-				karg.flags,
 				(struct vmem_pfn_entry __user *)(uintptr_t)
 					karg.entries_ptr,
 				&karg.count);
@@ -76,11 +75,10 @@ static long vmem_ioctl_get_ipc_fd(struct file *filp, unsigned long arg)
 	if (copy_from_user(&karg, (void __user *)arg, sizeof(karg)))
 		return -EFAULT;
 
+	/* entries[i].offset must be absolute PAs (daemon: vFE_bar_base + offset) */
 	dmabuf = vmem_create_dmabuf(
 		(struct vmem_pfn_entry __user *)(uintptr_t)karg.entries_ptr,
-		karg.count,
-		karg.consumer_bus, karg.consumer_device, karg.consumer_function,
-		karg.flags);
+		karg.count);
 	if (IS_ERR(dmabuf))
 		return PTR_ERR(dmabuf);
 
