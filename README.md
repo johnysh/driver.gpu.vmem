@@ -24,22 +24,25 @@ Origin Node                                    Peer Node
 ─────────────────────────────────────────      ──────────────────────────────────────
 GPU App                                        GPU App
   │ allocate VRAM                                │ import pseudo dma-buf → P2P R/W
-  │ zeMemGetIpcHandle()                          ↑
+  │ zeMemGetIpcHandle() → dma-buf fd             ↑
   ↓                                              │ zeMemOpenIpcHandle(pseudo_fd)
 libvmem (UMD)                                  libvmem (UMD)
-  │ VMEM_IOCTL_OPEN_DMABUF                       │ VMEM_IOCTL_GET_DMABUF
+  │ VMEM_IOCTL_OPEN_DMABUF(dmabuf_fd, bdf)       │ VMEM_IOCTL_GET_DMABUF
   ↓                                              │   input: {node_id, gpu_id, offsets}
 vMem KMD (/dev/vmemIntel)                      vMem KMD (/dev/vmemIntel)
-  │ dma_buf_dynamic_attach()                     │ astera_lookup(node_id, gpu_id)
-  │ dma_buf_map_attachment()                     │   -> (dbdf, bar, index)
-  │ extract BAR2-relative offsets                │ base = BAR_start + index × 32 GB
-  │ soft-pin (keep attach+sgt alive)             │ PA[i] = base + offset[i]
-  │ debugfs: imported                            │ dma_buf_export() -> pseudo_fd
-  ↓                                              │ vmem_buffer_obj tracked (kref)
-xe GPU driver                                   │ debugfs: exported
-  │                                              ↓
-  ·─── control channel: {node_id,gpu_id,offsets} ──→ xe GPU driver
-                                                       │
+  │ dma_buf_get() → dma_buf_dynamic_attach()     │ astera_lookup(node_id, gpu_id)
+  │ dma_buf_map_attachment() → sg_table          │   -> (dbdf, bar, index)
+  │ returns abs PA per chunk                     │ vfe_base = BAR_start + index × 32 GB
+  │   (sg_dma_address, IOMMU-off = PA)           │ PA'[i] = vfe_base + offset[i]
+  │ soft-pin (keep attach+sgt alive)             │ dma_buf_export() → pseudo_fd
+  │ debugfs: imported                            │ vmem_buffer_obj tracked (kref)
+  ↓                                              │ debugfs: exported
+libvmem (UMD) receives {abs PA[], count}        ↓
+  │ bar2_base = sysfs_read_bar2(bdf)           xe GPU driver
+  │ offset[i] = abs_pa[i] - bar2_base
+  │
+  ·─── control channel: {node_id, gpu_id, offset list} ──→ libvmem (UMD) Peer
+                                                                    │ (calls GET_DMABUF above)
                                                Astera PCIe Switch (PEX890xx)
                                                routes P2P DMA to origin VRAM
 ```
@@ -49,7 +52,7 @@ xe GPU driver                                   │ debugfs: exported
 | File | Responsibility |
 |------|----------------|
 | `vmem_drv.c` | Module init/exit, misc device registration, `open`/`release`, ioctl dispatch. Sets 64-bit DMA mask. Calls `vmem_debugfs_init/exit`. |
-| `vmem_dmabuf.c` | **Export path**: P2P attach → map → BAR-relative offset extraction → soft-pin. **Import path**: astera_lookup → PA synthesis → MMIO dma-buf → `vmem_buffer_obj` tracking. Debugfs hooks on each open/get and close/put. |
+| `vmem_dmabuf.c` | **Export path**: P2P attach → map → absolute PA extraction (sg_dma_address) → soft-pin; UMD computes BAR-relative offsets. **Import path**: astera_lookup → PA synthesis → MMIO dma-buf → `vmem_buffer_obj` tracking. Debugfs hooks on each open/get and close/put. |
 | `vmem_buffer.c` | `vmem_buffer_obj` lifecycle: `kref` init/get/put → release frees segs + obj. Per-fd `buffers` list for backstop cleanup. |
 | `vmem_debugfs.c` | Global `imported`/`exported` registry (two lists + one mutex). Read-only seq_file debugfs files under `/sys/kernel/debug/vmemIntel/`. |
 | `vmem_astera.c` | Spinlock-protected function-pointer registration stub. Exports `vmem_register/unregister_astera_lookup` so `astera_vfe.ko` can plug in at runtime. Returns `-ENOSYS` until registered. |
