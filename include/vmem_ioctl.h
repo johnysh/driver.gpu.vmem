@@ -1,19 +1,27 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
- * vmem_ioctl.h - vMem driver UAPI (v2.1)
+ * vmem_ioctl.h - vMem driver UAPI (v3.0)
  *
- * Consumer (peer) side only — origin-side scatter extraction removed.
+ * Method 1: address translation in KMD via Astera vFE kernel API.
+ * Every object is identified by a dma-buf fd; no opaque handles.
  *
- * The KMD imports the Astera vFE driver and calls its in-kernel lookup:
- *   astera_lookup(node_id, gpu_id) -> (dbdf, bar, index)
- *   base = pci_resource_start(dbdf, bar) + index * 32 GB
- *   PA'  = base + offset
- *   -> build MMIO dma-buf
+ * Origin side:
+ * VMEM_IOCTL_OPEN_DMABUF -- attach GPU dma-buf, extract BAR-relative offsets;
+ * keeps soft-pin until CLOSE_DMABUF or fd close
+ * VMEM_IOCTL_CLOSE_DMABUF -- release soft-pin for one dma-buf (by opened fd)
  *
- * VMEM_IOCTL_GET_IPC_HANDLE  -- build pseudo dma-buf from {node_id, gpu_id, offsets}
- * VMEM_IOCTL_PUT_IPC_HANDLE  -- destroy pseudo dma-buf fd
- * VMEM_IOCTL_VERSION         -- query driver version
- * VMEM_IOCTL_IDENTIFY_DMABUF -- probe which GPU owns a dma-buf
+ * Peer side (Method 1: in-kernel PA synthesis via Astera vFE):
+ * VMEM_IOCTL_GET_DMABUF -- input: {node_id, gpu_id, BAR-relative offset list}
+ * KMD: astera_lookup(node_id, gpu_id)
+ * -> (dbdf, bar, index)
+ * -> base = pci_resource_start(dbdf, bar)
+ * + index * 32 GB
+ * -> PA'[i] = base + offset[i]
+ * -> build MMIO dma-buf -> fd
+ * VMEM_IOCTL_PUT_DMABUF -- destroy pseudo dma-buf fd
+ *
+ * Utilities:
+ * VMEM_IOCTL_VERSION -- query driver version
  */
 #ifndef _UAPI_VMEM_IOCTL_H
 #define _UAPI_VMEM_IOCTL_H
@@ -29,111 +37,125 @@
 
 #define VMEM_MAGIC 'V'
 
-#define VMEM_DRV_VERSION_MAJOR 2
-#define VMEM_DRV_VERSION_MINOR 1
+#define VMEM_DRV_VERSION_MAJOR 3
+#define VMEM_DRV_VERSION_MINOR 0
 #define VMEM_DRV_VERSION_PATCH 0
 
-/* Recommended userspace buffer size for vmem_pfn_entry[] (not a hard kernel limit) */
 #define VMEM_MAX_PFN_ENTRIES 4096
 
 /**
  * struct vmem_pfn_entry - one scatter chunk
- * @offset: BAR-relative byte offset from the origin GPU's VRAM base
- *          (produced by the origin node; KMD adds vFE window base to get PA')
- * @size:   byte length of this chunk (page-aligned)
+ * @offset: OPEN_DMABUF output: BAR2-relative byte offset from GPU VRAM base
+ * GET_DMABUF input: same BAR-relative offset (KMD computes PA)
+ * @size: page-aligned byte length
  */
 struct vmem_pfn_entry {
-	__u64 offset;
-	__u32 size;
-	__u32 pad;
+ __u64 offset;
+ __u32 size;
+ __u32 pad;
 };
 
 /* ── Argument structures ─────────────────────────────────── */
 
 /** struct vmem_ioctl_version_arg - VMEM_IOCTL_VERSION */
 struct vmem_ioctl_version_arg {
-	__u16 major;
-	__u16 minor;
-	__u16 patch;
-	__u16 reserved;
+ __u16 major;
+ __u16 minor;
+ __u16 patch;
+ __u16 reserved;
 };
 
 /**
- * struct vmem_ioctl_get_ipc_handle_arg - VMEM_IOCTL_GET_IPC_HANDLE
+ * struct vmem_ioctl_open_dmabuf_arg - VMEM_IOCTL_OPEN_DMABUF
  *
- * Input: BAR-relative scatter offsets produced by the origin node, forwarded
- * over the control channel together with the origin's node_id and gpu_id.
+ * Origin: attach to a GPU dma-buf and extract BAR2-relative scatter offsets.
+ * The KMD keeps the attachment alive (soft-pin) so XE TTM cannot evict
+ * the VRAM BO while the peer holds the offset list.
+ * Release via VMEM_IOCTL_CLOSE_DMABUF or vmem fd close.
  *
- * KMD steps:
- *   1. astera_lookup(node_id, gpu_id) -> (dbdf, bar, index)
- *   2. base = pci_resource_start(dbdf, bar) + index * 32 GB
- *   3. PA'[i] = base + entries[i].offset
- *   4. build MMIO pseudo dma-buf backed by PA' array
+ * Two-step count negotiation:
+ * Pass count=0 -> KMD returns -ENOSPC with count=required.
+ * Allocate entries_ptr[count], call again -> KMD fills the array.
  *
- * @node_id:     in:  remote node identifier
- * @gpu_id:      in:  remote GPU identifier on that node
- * @count:       in:  number of entries in entries_ptr[]
- * @entries_ptr: in:  userspace ptr -> vmem_pfn_entry[] (BAR-relative offsets)
- * @fd:          out: pseudo dma-buf fd (import into xe via zeMemOpenIpcHandle)
+ * @fd: in: GPU dma-buf fd (from zeMemGetIpcHandle)
+ * @bus/device/function: in: GPU PCIe BDF
+ * @count: in/out: entry buffer capacity / actual entry count
+ * @entries_ptr: in: userspace ptr -> vmem_pfn_entry[] output buffer
  */
-struct vmem_ioctl_get_ipc_handle_arg {
-	__u32  node_id;
-	__u32  gpu_id;
-	__u32  count;
-	__u32  pad;
-	__u64  entries_ptr;
-	__s32  fd;
-	__u32  pad2;
+struct vmem_ioctl_open_dmabuf_arg {
+ __s32 fd;
+ __u8 bus;
+ __u8 device;
+ __u8 function;
+ __u8 pad2;
+ __u32 count;
+ __u32 pad;
+ __u64 entries_ptr;
 };
 
 /**
- * struct vmem_ioctl_put_ipc_handle_arg - VMEM_IOCTL_PUT_IPC_HANDLE
+ * struct vmem_ioctl_get_dmabuf_arg - VMEM_IOCTL_GET_DMABUF (Method 1)
  *
- * Destroy the pseudo dma-buf fd returned by GET_IPC_HANDLE.
- * Equivalent to close(fd); provided for lifecycle symmetry.
+ * Peer: build a pseudo dma-buf from BAR-relative offsets received from origin.
+ * KMD calls astera_lookup(node_id, gpu_id) -> (dbdf, bar, index), then:
+ * base = pci_resource_start(dbdf, bar) + index * 32 GB
+ * PA'[i] = base + entries[i].offset
+ *
+ * @node_id: in: remote node identifier (forwarded from origin over ctrl channel)
+ * @gpu_id: in: remote GPU identifier on that node
+ * @count: in: number of BAR-relative offset entries
+ * @entries_ptr: in: userspace ptr -> vmem_pfn_entry[] (BAR-relative offsets from origin)
+ * @fd: out: pseudo dma-buf fd (import into xe via zeMemOpenIpcHandle)
  */
-struct vmem_ioctl_put_ipc_handle_arg {
-	__s32 fd;
-	__u32 pad;
+struct vmem_ioctl_get_dmabuf_arg {
+ __u32 node_id;
+ __u32 gpu_id;
+ __u32 count;
+ __u32 pad;
+ __u64 entries_ptr;
+ __s32 fd;
+ __u32 pad2;
 };
 
 /**
- * struct vmem_ioctl_identify_dmabuf_arg - VMEM_IOCTL_IDENTIFY_DMABUF
- *
- * Probe which GPU's VRAM backs a dma-buf via temporary attach + BAR scan.
+ * struct vmem_ioctl_put_dmabuf_arg - VMEM_IOCTL_PUT_DMABUF
+ * Peer: destroy pseudo dma-buf fd returned by GET_DMABUF.
+ * @fd: the fd returned by VMEM_IOCTL_GET_DMABUF
  */
-struct vmem_ioctl_identify_dmabuf_arg {
-	__s32  fd;
-	__u8   bus;
-	__u8   device;
-	__u8   function;
-	__u8   pad;
-	__u8   source_bus;
-	__u8   source_device;
-	__u8   source_function;
-	__u8   pad2;
+struct vmem_ioctl_put_dmabuf_arg {
+ __s32 fd;
+ __u32 pad;
+};
+
+/**
+ * struct vmem_ioctl_close_dmabuf_arg - VMEM_IOCTL_CLOSE_DMABUF
+ * Origin: release persistent soft-pin kept since OPEN_DMABUF.
+ * @fd: the GPU dma-buf fd originally passed to VMEM_IOCTL_OPEN_DMABUF
+ */
+struct vmem_ioctl_close_dmabuf_arg {
+ __s32 fd;
+ __u32 pad;
 };
 
 /* ── IOCTL commands ──────────────────────────────────────── */
 
 #define VMEM_IOCTL_VERSION \
-	_IOR(VMEM_MAGIC, 0x00, struct vmem_ioctl_version_arg)
+ _IOR(VMEM_MAGIC, 0x00, struct vmem_ioctl_version_arg)
 
-/* 0x01: reserved (was OPEN_IPC_HANDLE / GET_PFN_OFFSET_LIST) */
+/* Origin: attach GPU dma-buf -> BAR-relative scatter offsets + soft-pin */
+#define VMEM_IOCTL_OPEN_DMABUF \
+ _IOWR(VMEM_MAGIC, 0x01, struct vmem_ioctl_open_dmabuf_arg)
 
-/* Build pseudo dma-buf via in-kernel Astera vFE lookup */
-#define VMEM_IOCTL_GET_IPC_HANDLE \
-	_IOWR(VMEM_MAGIC, 0x02, struct vmem_ioctl_get_ipc_handle_arg)
+/* Peer: Method 1 - astera_lookup in KMD, PA synthesis, pseudo dma-buf fd */
+#define VMEM_IOCTL_GET_DMABUF \
+ _IOWR(VMEM_MAGIC, 0x02, struct vmem_ioctl_get_dmabuf_arg)
 
-/* Destroy pseudo dma-buf fd */
-#define VMEM_IOCTL_PUT_IPC_HANDLE \
-	_IOW(VMEM_MAGIC, 0x03, struct vmem_ioctl_put_ipc_handle_arg)
+/* Peer: destroy pseudo dma-buf fd */
+#define VMEM_IOCTL_PUT_DMABUF \
+ _IOW(VMEM_MAGIC, 0x03, struct vmem_ioctl_put_dmabuf_arg)
 
-/* 0x04: reserved (was CLOSE_IPC_HANDLE / PUT_IPC_FD) */
-
-/* 0x05: reserved */
-
-#define VMEM_IOCTL_IDENTIFY_DMABUF \
-	_IOWR(VMEM_MAGIC, 0x06, struct vmem_ioctl_identify_dmabuf_arg)
+/* Origin: release soft-pin (by the opened GPU dma-buf fd) */
+#define VMEM_IOCTL_CLOSE_DMABUF \
+ _IOW(VMEM_MAGIC, 0x04, struct vmem_ioctl_close_dmabuf_arg)
 
 #endif /* _UAPI_VMEM_IOCTL_H */

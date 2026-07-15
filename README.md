@@ -1,6 +1,6 @@
 # vMem KMD — PCIe Cross-Node GPU dma-buf Translator
 
-**Version:** 2.1.0 | **License:** GPL-2.0 | **Device:** `/dev/vmemIntel`
+**Version:** 2.2.0 | **License:** GPL-2.0 | **Device:** `/dev/vmemIntel`
 
 ## Overview
 
@@ -283,9 +283,28 @@ contains. There is no hard kernel limit; the peer passes the actual count in `GE
 
 ## Changelog
 
-### v2.1.0
+### v2.2.0
 
-- **Removed origin side**: `OPEN_IPC_HANDLE`, `CLOSE_IPC_HANDLE`, `vmem_open_ipc_handle()`,
+- **Restored origin side**:  and  re-added;
+  , , ,
+  ,  and soft-pin machinery restored
+- **vmem_drv.c**: xdg-open - opens a file or URL in the user's preferred application
+
+Synopsis
+
+xdg-open { file | URL }
+
+xdg-open { --help | --manual | --version }
+
+Use 'man xdg-open' or 'xdg-open --manual' for additional info./ fops restored for per-fd pin tracking;
+  fd close auto-sweeps remaining pins (process crash backstop)
+- **Peer side unchanged**:  (Method 1) and  kept
+
+### v2.1.0 (retracted)
+
+- Incorrectly removed origin side; superseded by v2.2.0
+
+### v2.1.0-orig: `OPEN_IPC_HANDLE`, `CLOSE_IPC_HANDLE`, `vmem_open_ipc_handle()`,
   `vmem_import_pin`, `vmem_file_priv`, soft-pin machinery — all deleted
 - **`vmem_get_ipc_handle()`**: renamed from `vmem_get_ipc_handle_method1`; now the single
   public function in `vmem_dmabuf.c`
