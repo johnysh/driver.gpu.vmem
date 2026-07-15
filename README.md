@@ -30,8 +30,8 @@ vMem KMD (/dev/vmemIntel)                vMem KMD (/dev/vmemIntel)
   │   sg_table → BAR-relative offsets      │     → (dbdf, bar, index)
   │   soft-pin (keep attachment alive)     │   base = BAR_start + index × 32 GiB
   ↓                                        │   PA'  = base + offset   [per scatter]
-vMem UMD / daemon                        │   build MMIO vmem_buf → dma_buf_export()
-  │ {offsets, gpu_id, node_id}  ────────→ └──── pseudo dma-buf fd
+vMem UMD / daemon                          │   build MMIO vmem_buf → dma_buf_export()
+  │ {offsets, gpu_id, node_id}  ────────→  └──── pseudo dma-buf fd
   └──── control path (any IPC channel)
                                                     ↑
                                           vmem_astera.c (registration stub)
