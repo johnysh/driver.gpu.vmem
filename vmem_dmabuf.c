@@ -3,14 +3,16 @@
  * vmem_dmabuf.c - vMem dma-buf operations (Method 1: KMD PA synthesis)
  *
  * Origin side:
- *   vmem_open_dmabuf_fd()   -- P2P attach, extract BAR-relative offsets, soft-pin
+ *   vmem_open_dmabuf_fd()   -- P2P attach, walk sg_table, return ABSOLUTE PAs.
+ *                              UMD computes: offset[i] = pa[i] - gpu_bar2_base
  *   vmem_close_dmabuf()     -- release soft-pin: unmap -> detach -> put
  *   vmem_import_pins_cleanup() -- backstop sweep on vmem fd close / crash
  *
  * Peer side (Method 1: in-kernel PA synthesis via Astera vFE):
- *   vmem_get_dmabuf_fd()    -- astera_lookup(node_id, gpu_id) -> base
- *                              -> PA[i] = base + offset[i] -> MMIO dma-buf fd
- *   vmem_put_dmabuf()       -- remove buffer_obj, close_fd, kref_put
+ *   vmem_get_dmabuf_fd()    -- astera_lookup(node_id, gpu_id) -> vfe_base
+ *                              -> PA'[i] = vfe_base + entries[i].addr (BAR-relative)
+ *                              -> MMIO pseudo dma-buf fd
+ *   vmem_put_dmabuf()       -- remove vmem_buffer_obj, close_fd, kref_put
  *   vmem_buffers_cleanup()  -- backstop sweep of remaining exported bufs
  */
 
@@ -48,46 +50,48 @@ static const struct dma_buf_attach_ops vmem_importer_ops = {
  * ========================================================================== */
 
 /**
- * vmem_open_dmabuf_fd - attach to GPU dma-buf and extract BAR-relative offsets
+ * vmem_open_dmabuf_fd - attach to GPU dma-buf and return absolute physical addresses
  *
  * Implements VMEM_IOCTL_OPEN_DMABUF.
  *
- * Extracts BAR2-relative scatter offsets from the GPU dma-buf sg_table.
- * Stores the attachment alive (soft-pin) to prevent TTM eviction while the
- * peer holds the offset list.
+ * KMD flow (§5.1):
+ *   dma_buf_get(fd)  ->  dynamic P2P attach (allow_peer2peer=true, owning GPU)
+ *   dma_buf_map_attachment()  ->  sg_table
+ *   For each sg entry: sg_dma_address() == PA  (IOMMU-off assumption)
+ *   Returns {abs PA, size} per chunk in entries[].addr/size
+ *   Keeps attachment + sg_table alive as soft-pin.
  *
- * Two-step count negotiation: pass *count=0 -> returns -ENOSPC with
- * *count=required; allocate entries; call again to fill.
+ * UMD responsibility after this call:
+ *   bar2_base = sysfs_read_bar2(bus, device, function)
+ *   offset[i] = entries[i].addr - bar2_base   <- BAR-relative, send to peer
+ *
+ * Two-step count negotiation:
+ *   count=0  -> -ENOSPC, count=required N
+ *   count=N  -> fills entries[], page_size=PAGE_SIZE, total_size=sum(size[i])
  */
 int vmem_open_dmabuf_fd(struct vmem_file_priv *priv,
 			int dmabuf_fd, u8 bus, u8 pci_devno, u8 fn,
 			struct vmem_pfn_entry __user *entries_ptr,
-			u32 *count)
+			u32 *count, u32 *page_size, u64 *total_size)
 {
 	struct pci_dev *pdev = NULL;
 	struct dma_buf *dmabuf = NULL;
 	struct dma_buf_attachment *attach = NULL;
 	struct sg_table *sgt = NULL;
-	phys_addr_t bar2_base = 0;
 	struct vmem_pfn_entry *kentries = NULL;
 	struct vmem_seg *dbg_segs = NULL;
 	u32 capacity = *count;
 	u32 nr_entries;
-	size_t total = 0;
+	u64 total = 0;
 	struct scatterlist *sg;
 	int i, ret = 0;
 
+	/* GPU pdev is needed only for the P2P attach device; BAR2 is NOT read here */
 	pdev = pci_get_domain_bus_and_slot(0, bus, PCI_DEVFN(pci_devno, fn));
 	if (!pdev) {
 		pr_err("vmem: open_dmabuf: GPU %02x:%02x.%x not found\n",
 		       bus, pci_devno, fn);
 		return -ENODEV;
-	}
-
-	bar2_base = pci_resource_start(pdev, 2);
-	if (!bar2_base) {
-		pr_err("vmem: open_dmabuf: GPU BAR2 not available\n");
-		ret = -ENXIO; goto put_pdev;
 	}
 
 	dmabuf = dma_buf_get(dmabuf_fd);
@@ -101,6 +105,10 @@ int vmem_open_dmabuf_fd(struct vmem_file_priv *priv,
 		ret = PTR_ERR(attach); goto put_dmabuf;
 	}
 
+	/*
+	 * TODO: hard-pin via dma_buf_pin() when xe >= 6.19 is minimum.
+	 * Until then, keeping attach + sgt alive is the soft-pin.
+	 */
 	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
 	if (IS_ERR(sgt)) {
 		pr_err("vmem: open_dmabuf: dma_buf_map_attachment failed: %ld\n",
@@ -118,18 +126,19 @@ int vmem_open_dmabuf_fd(struct vmem_file_priv *priv,
 
 	i = 0;
 	for_each_sgtable_dma_sg(sgt, sg, i) {
-		dma_addr_t dma_addr = sg_dma_address(sg);
+		/*
+		 * IOMMU-off: sg_dma_address() == CPU physical address.
+		 * Return absolute PA to UMD; UMD computes
+		 *   offset = abs_pa - gpu_bar2_base
+		 * and forwards offset list to peer.
+		 */
+		dma_addr_t abs_pa = sg_dma_address(sg);
 		u32 sz = sg_dma_len(sg);
 
-		if (dma_addr < bar2_base) {
-			pr_err("vmem: open_dmabuf: sg[%d] dma_addr 0x%llx < BAR2 0x%llx\n",
-			       i, (u64)dma_addr, (u64)bar2_base);
-			ret = -EINVAL; goto free_tmp;
-		}
-		kentries[i].offset = (u64)(dma_addr - bar2_base);
-		kentries[i].size   = sz;
-		dbg_segs[i].base   = (phys_addr_t)dma_addr;
-		dbg_segs[i].len    = sz;
+		kentries[i].addr = (u64)abs_pa;
+		kentries[i].size = sz;
+		dbg_segs[i].base = (phys_addr_t)abs_pa;
+		dbg_segs[i].len  = sz;
 		total += sz;
 	}
 
@@ -138,6 +147,8 @@ int vmem_open_dmabuf_fd(struct vmem_file_priv *priv,
 	}
 
 	kvfree(kentries);
+	*page_size  = PAGE_SIZE;
+	*total_size = total;
 
 	/* Store soft-pin */
 	{
@@ -156,9 +167,8 @@ int vmem_open_dmabuf_fd(struct vmem_file_priv *priv,
 		vmem_debugfs_add_imported(pin->pid, dmabuf_fd, total,
 					  dbg_segs, nr_entries);
 		kvfree(dbg_segs);
-
-		pr_info("vmem: open_dmabuf: fd=%d %u entries bar2=0x%llx\n",
-			dmabuf_fd, nr_entries, (u64)bar2_base);
+		pr_info("vmem: open_dmabuf: fd=%d %u chunks total=0x%llx (abs PAs returned)\n",
+			dmabuf_fd, nr_entries, total);
 		return 0;
 	}
 
@@ -188,8 +198,7 @@ void vmem_import_pins_cleanup(struct vmem_file_priv *priv)
 	list_for_each_entry_safe(pin, tmp, &priv->import_pins, link) {
 		list_del(&pin->link);
 		vmem_debugfs_del_imported(pin->pid, pin->orig_fd);
-		dma_buf_unmap_attachment_unlocked(pin->attach, pin->sgt,
-						  DMA_BIDIRECTIONAL);
+		dma_buf_unmap_attachment_unlocked(pin->attach, pin->sgt, DMA_BIDIRECTIONAL);
 		dma_buf_detach(pin->dmabuf, pin->attach);
 		dma_buf_put(pin->dmabuf);
 		pci_dev_put(pin->pdev);
@@ -245,7 +254,8 @@ static struct sg_table *vmem_dmabuf_map(struct dma_buf_attachment *attach,
 
 	sg = sgt->sgl;
 	for (i = 0; i < vbuf->nr_entries; i++, sg = sg_next(sg)) {
-		phys_addr_t phys = (phys_addr_t)vbuf->entries[i].offset;
+		/* entries[i].addr holds absolute peer-side PA (vFE MMIO window) */
+		phys_addr_t phys = (phys_addr_t)vbuf->entries[i].addr;
 		size_t sz = vbuf->entries[i].size;
 		dma_addr_t dma;
 
@@ -309,7 +319,7 @@ static int vmem_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 	for (i = 0; i < vbuf->nr_entries; i++) {
 		ret = io_remap_pfn_range(vma, vaddr,
-					 (phys_addr_t)vbuf->entries[i].offset >> PAGE_SHIFT,
+					 (phys_addr_t)vbuf->entries[i].addr >> PAGE_SHIFT,
 					 vbuf->entries[i].size, vma->vm_page_prot);
 		if (ret) { pr_err("vmem: io_remap_pfn_range failed entry %u\n", i); return ret; }
 		vaddr += vbuf->entries[i].size;
@@ -332,7 +342,7 @@ static const struct dma_buf_ops vmem_dmabuf_ops = {
 };
 
 /* ==========================================================================
- * Peer: vmem_get_dmabuf_fd  (Method 1: in-kernel PA synthesis)
+ * Peer: vmem_get_dmabuf_fd  (Method 1)
  * ========================================================================== */
 
 /**
@@ -340,14 +350,15 @@ static const struct dma_buf_ops vmem_dmabuf_ops = {
  *
  * Implements VMEM_IOCTL_GET_DMABUF (Method 1).
  *
+ * UMD fills entries[i].addr with BAR-relative offsets received from origin:
+ *   offset[i] = abs_pa[i] - gpu_bar2_base   (computed by origin UMD)
+ *
  * KMD flow:
  *   1. astera_lookup(node_id, gpu_id) -> ep = {domain, bus, devfn, bar, index}
- *   2. base  = pci_resource_start(dbdf, bar) + index * VMEM_VFE_WINDOW_SIZE
- *   3. PA[i] = base + entries[i].offset
+ *   2. vfe_base = pci_resource_start(dbdf, bar) + index * VMEM_VFE_WINDOW_SIZE
+ *   3. PA'[i]   = vfe_base + entries[i].addr
  *   4. export MMIO pseudo dma-buf -> install fd
  *   5. allocate vmem_buffer_obj, track in priv->buffers, record in debugfs
- *
- * Returns installed fd (>= 0) on success, negative errno on failure.
  */
 int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 		       u32 node_id, u32 gpu_id,
@@ -356,7 +367,7 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 {
 	struct astera_vfe_ep ep;
 	struct pci_dev *pdev;
-	phys_addr_t bar_start, base;
+	phys_addr_t bar_start, vfe_base;
 	struct vmem_pfn_entry *bar_entries, *pa_entries;
 	struct vmem_buf *vbuf;
 	struct vmem_buffer_obj *obj;
@@ -376,7 +387,7 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 		return ret;
 	}
 
-	/* Step 2: compute MMIO window base */
+	/* Step 2: compute vFE MMIO window base */
 	pdev = pci_get_domain_bus_and_slot(ep.domain, ep.bus, ep.devfn);
 	if (!pdev) {
 		pr_err("vmem: get_dmabuf: vFE pdev not found (%04x:%02x:%02x.%u)\n",
@@ -389,9 +400,9 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 		pr_err("vmem: get_dmabuf: vFE BAR%u not mapped\n", ep.bar);
 		return -ENXIO;
 	}
-	base = bar_start + (phys_addr_t)ep.index * VMEM_VFE_WINDOW_SIZE;
+	vfe_base = bar_start + (phys_addr_t)ep.index * VMEM_VFE_WINDOW_SIZE;
 
-	/* Copy BAR-relative entries from userspace */
+	/* Copy BAR-relative offset entries from userspace */
 	bar_entries = kvcalloc(count, sizeof(*bar_entries), GFP_KERNEL);
 	if (!bar_entries) return -ENOMEM;
 	if (copy_from_user(bar_entries, entries_ptr, count * sizeof(*bar_entries))) {
@@ -399,14 +410,17 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 		return -EFAULT;
 	}
 
-	/* Step 3: translate BAR-relative offsets -> absolute PAs */
+	/* Step 3: translate BAR-relative offsets -> absolute peer-side PAs */
 	pa_entries = kvcalloc(count, sizeof(*pa_entries), GFP_KERNEL);
 	if (!pa_entries) { kvfree(bar_entries); return -ENOMEM; }
 
 	for (i = 0; i < count; i++) {
-		pa_entries[i].offset = (u64)(base + bar_entries[i].offset);
-		pa_entries[i].size   = bar_entries[i].size;
+		pa_entries[i].addr = (u64)(vfe_base + bar_entries[i].addr);
+		pa_entries[i].size = bar_entries[i].size;
 		total += bar_entries[i].size;
+		pr_debug("vmem: pa[%u] = 0x%llx + 0x%llx = 0x%llx size=%u\n",
+			 i, (u64)vfe_base, bar_entries[i].addr,
+			 pa_entries[i].addr, pa_entries[i].size);
 	}
 	kvfree(bar_entries);
 
@@ -431,34 +445,28 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 	}
 
 	fd = dma_buf_fd(dmabuf, O_CLOEXEC);
-	if (fd < 0) {
-		dma_buf_put(dmabuf);
-		return fd;
-	}
+	if (fd < 0) { dma_buf_put(dmabuf); return fd; }
 
-	/* Step 5: allocate vmem_buffer_obj, fill segs, add to priv->buffers */
+	/* Step 5: track with vmem_buffer_obj */
 	obj = vmem_buffer_obj_alloc(count, total);
 	if (!obj) {
-		/* fd is installed; we cannot easily undo it, so just warn */
 		pr_warn("vmem: get_dmabuf: vmem_buffer_obj_alloc failed, fd=%d leaks\n", fd);
 		goto done;
 	}
 	obj->dmabuf_fd = fd;
 	obj->pid       = task_pid_nr(current);
 	for (i = 0; i < count; i++) {
-		obj->segs[i].base = (phys_addr_t)pa_entries[i].offset;
+		obj->segs[i].base = (phys_addr_t)pa_entries[i].addr;
 		obj->segs[i].len  = pa_entries[i].size;
 	}
-
 	mutex_lock(&priv->buf_lock);
 	list_add_tail(&obj->link, &priv->buffers);
 	mutex_unlock(&priv->buf_lock);
-
 	vmem_debugfs_add_exported(obj->pid, fd, total, obj->segs, count);
 
 done:
-	pr_info("vmem: get_dmabuf: fd=%d %u entries node=%u gpu=%u base=0x%llx\n",
-		fd, count, node_id, gpu_id, (u64)base);
+	pr_info("vmem: get_dmabuf: fd=%d %u entries node=%u gpu=%u vfe_base=0x%llx\n",
+		fd, count, node_id, gpu_id, (u64)vfe_base);
 	return fd;
 }
 
@@ -479,7 +487,6 @@ int vmem_put_dmabuf(struct vmem_file_priv *priv, int exported_fd)
 		}
 	}
 	mutex_unlock(&priv->buf_lock);
-
 	if (!found) return -ENOENT;
 
 	vmem_debugfs_del_exported(found->pid, exported_fd);
@@ -490,7 +497,7 @@ int vmem_put_dmabuf(struct vmem_file_priv *priv, int exported_fd)
 }
 
 /* ==========================================================================
- * Peer: vmem_buffers_cleanup  (backstop on vmem fd close / crash)
+ * Peer: vmem_buffers_cleanup  (backstop)
  * ========================================================================== */
 
 void vmem_buffers_cleanup(struct vmem_file_priv *priv)

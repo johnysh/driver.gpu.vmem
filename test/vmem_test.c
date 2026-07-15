@@ -39,9 +39,9 @@ static int test_version(void)
 static int test_get_dmabuf(uint32_t node_id, uint32_t gpu_id)
 {
     struct vmem_pfn_entry entries[3] = {
-        { .offset = 0x000000ULL, .size = 4 << 20 },
-        { .offset = 0x400000ULL, .size = 4 << 20 },
-        { .offset = 0x800000ULL, .size = 4 << 20 },
+        { .addr = 0x000000ULL, .size = 4 << 20 },
+        { .addr = 0x400000ULL, .size = 4 << 20 },
+        { .addr = 0x800000ULL, .size = 4 << 20 },
     };
     struct vmem_ioctl_get_dmabuf_arg arg = {
         .node_id     = node_id,

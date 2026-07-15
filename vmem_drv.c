@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * vmem_drv.c - vMem Linux kernel driver (v3.0)
+ * vmem_drv.c - vMem Linux kernel driver (v3.1)
  *
- * Device: /dev/vmemIntel
- *
- * IOCTL surface (Method 1 - address translation in KMD via Astera vFE):
+ * IOCTL surface (Method 1 - KMD PA synthesis via Astera vFE):
  *   VMEM_IOCTL_VERSION       -- query driver version
- *   VMEM_IOCTL_OPEN_DMABUF   -- origin: attach GPU dma-buf, extract offsets, soft-pin
- *   VMEM_IOCTL_CLOSE_DMABUF  -- origin: release soft-pin (by opened fd)
- *   VMEM_IOCTL_GET_DMABUF    -- peer: astera_lookup -> PA synthesis -> pseudo dma-buf fd
+ *   VMEM_IOCTL_OPEN_DMABUF   -- origin: P2P attach, return absolute PAs (abs sg_dma_address)
+ *                               UMD computes: offset[i] = pa[i] - gpu_bar2_base
+ *   VMEM_IOCTL_CLOSE_DMABUF  -- origin: release soft-pin
+ *   VMEM_IOCTL_GET_DMABUF    -- peer: BAR-relative offsets -> astera_lookup -> PA synthesis
  *   VMEM_IOCTL_PUT_DMABUF    -- peer: destroy pseudo dma-buf
- *
- * Backstop: vmem fd close (including process crash) sweeps all remaining
- *   import_pins via vmem_import_pins_cleanup() and all exported buffers via
- *   vmem_buffers_cleanup().
- *
- * Debugfs: /sys/kernel/debug/vmemIntel/{imported,exported}
  */
 
 #include <linux/module.h>
@@ -36,9 +29,7 @@
 #include "vmem_debugfs.h"
 
 #define VMEM_DRV_NAME    "vmemIntel"
-#define VMEM_DRV_VERSION "3.0.0"
-
-/* ── IOCTL handlers ───────────────────────────────────────── */
+#define VMEM_DRV_VERSION "3.1.0"
 
 static long vmem_ioctl_version(struct file *filp, unsigned long arg)
 {
@@ -53,9 +44,9 @@ static long vmem_ioctl_version(struct file *filp, unsigned long arg)
 }
 
 /*
- * Origin: attach GPU dma-buf, extract BAR-relative offsets, store soft-pin.
- * Two-step count negotiation: call with count=0 -> -ENOSPC + count=required;
- * allocate; call again to fill.
+ * Origin: OPEN_DMABUF
+ * KMD attaches GPU dma-buf, walks sg_table, returns ABSOLUTE physical addresses.
+ * UMD then computes BAR-relative offsets: offset[i] = pa[i] - bar2_base.
  */
 static long vmem_ioctl_open_dmabuf(struct file *filp, unsigned long arg)
 {
@@ -69,18 +60,14 @@ static long vmem_ioctl_open_dmabuf(struct file *filp, unsigned long arg)
 	ret = vmem_open_dmabuf_fd(priv,
 				  karg.fd, karg.bus, karg.device, karg.function,
 				  (struct vmem_pfn_entry __user *)(uintptr_t)karg.entries_ptr,
-				  &karg.count);
+				  &karg.count, &karg.page_size, &karg.total_size);
 
-	/* Always write back count (actual or required for -ENOSPC retry) */
+	/* Always write back count (and page_size/total_size on success) */
 	if (copy_to_user((void __user *)arg, &karg, sizeof(karg)))
 		return -EFAULT;
 	return ret;
 }
 
-/*
- * Origin: release persistent soft-pin kept since OPEN_DMABUF.
- * @fd: the GPU dma-buf fd originally passed to OPEN_DMABUF.
- */
 static long vmem_ioctl_close_dmabuf(struct file *filp, unsigned long arg)
 {
 	struct vmem_file_priv *priv = filp->private_data;
@@ -89,18 +76,16 @@ static long vmem_ioctl_close_dmabuf(struct file *filp, unsigned long arg)
 
 	if (copy_from_user(&karg, (void __user *)arg, sizeof(karg)))
 		return -EFAULT;
-
 	ret = vmem_close_dmabuf(priv, karg.fd);
 	if (ret)
-		pr_warn("vmem: CLOSE_DMABUF fd=%d: no matching pin (%d)\n",
-			karg.fd, ret);
+		pr_warn("vmem: CLOSE_DMABUF fd=%d: no matching pin (%d)\n", karg.fd, ret);
 	return ret;
 }
 
 /*
- * Peer: Method 1 - receive {node_id, gpu_id, BAR-relative offsets},
- * call vmem_get_dmabuf_fd() which internally runs astera_lookup() and
- * computes absolute PAs, then returns a pseudo dma-buf fd.
+ * Peer: GET_DMABUF (Method 1)
+ * Input: {node_id, gpu_id, BAR-relative offset entries}
+ * KMD: astera_lookup -> vfe_base -> PA'[i] = vfe_base + entries[i].addr -> pseudo dma-buf fd
  */
 static long vmem_ioctl_get_dmabuf(struct file *filp, unsigned long arg)
 {
@@ -115,8 +100,7 @@ static long vmem_ioctl_get_dmabuf(struct file *filp, unsigned long arg)
 				karg.node_id, karg.gpu_id,
 				(struct vmem_pfn_entry __user *)(uintptr_t)karg.entries_ptr,
 				karg.count);
-	if (fd < 0)
-		return fd;
+	if (fd < 0) return fd;
 
 	karg.fd = fd;
 	if (copy_to_user((void __user *)arg, &karg, sizeof(karg))) {
@@ -126,7 +110,6 @@ static long vmem_ioctl_get_dmabuf(struct file *filp, unsigned long arg)
 	return 0;
 }
 
-/* Peer: destroy pseudo dma-buf fd returned by GET_DMABUF */
 static long vmem_ioctl_put_dmabuf(struct file *filp, unsigned long arg)
 {
 	struct vmem_file_priv *priv = filp->private_data;
@@ -136,8 +119,6 @@ static long vmem_ioctl_put_dmabuf(struct file *filp, unsigned long arg)
 		return -EFAULT;
 	return vmem_put_dmabuf(priv, karg.fd);
 }
-
-/* ── File operations ──────────────────────────────────────── */
 
 static long vmem_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
@@ -169,7 +150,6 @@ static int vmem_release(struct inode *inode, struct file *filp)
 	struct vmem_file_priv *priv = filp->private_data;
 
 	if (priv) {
-		/* Backstop: sweep any un-released pins and exported buffers */
 		vmem_import_pins_cleanup(priv);
 		vmem_buffers_cleanup(priv);
 		mutex_destroy(&priv->pin_lock);
@@ -195,8 +175,6 @@ static struct miscdevice vmem_misc = {
 	.mode  = 0666,
 };
 
-/* ── Module init / exit ───────────────────────────────────── */
-
 static int __init vmem_init(void)
 {
 	int ret = misc_register(&vmem_misc);
@@ -206,6 +184,7 @@ static int __init vmem_init(void)
 	vmem_debugfs_init();
 	pr_info("vmem: driver v%s loaded, /dev/%s (minor %d)\n",
 		VMEM_DRV_VERSION, VMEM_DRV_NAME, vmem_misc.minor);
+	pr_info("vmem: OPEN_DMABUF returns abs PAs; UMD computes BAR-relative offsets\n");
 	pr_info("vmem: GET_DMABUF returns -ENOSYS until astera_vfe.ko registers\n");
 	return 0;
 }
