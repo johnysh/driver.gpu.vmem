@@ -26,7 +26,7 @@
 
 #include "../include/vmem_ioctl.h"
 
-#define VMEM_DEV "/dev/vmem"
+#define VMEM_DEV "/dev/vmemIntel"
 #define TEST_PASS "\033[32mPASS\033[0m"
 #define TEST_FAIL "\033[31mFAIL\033[0m"
 
@@ -49,7 +49,7 @@ static int test_open_device(void)
 		fprintf(stderr, "  Is the vmem module loaded? Try: insmod vmem.ko\n");
 		return -1;
 	}
-	printf("[%s] open /dev/vmem  (fd=%d)\n", TEST_PASS, vmem_fd);
+	printf("[%s] open /dev/vmemIntel  (fd=%d)\n", TEST_PASS, vmem_fd);
 	return 0;
 }
 

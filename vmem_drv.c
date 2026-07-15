@@ -25,7 +25,7 @@
 #include "include/vmem_ioctl.h"
 #include "vmem_dmabuf.h"
 
-#define VMEM_DRV_NAME    "vmem"
+#define VMEM_DRV_NAME    "vmemIntel"
 #define VMEM_DRV_VERSION "1.0.0"
 
 /* ── IOCTL handlers ───────────────────────────────────────── */

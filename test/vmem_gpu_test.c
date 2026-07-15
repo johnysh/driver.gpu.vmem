@@ -48,7 +48,7 @@
 /* -- Config ---------------------------------------------------------------- */
 #define TEST_SIZE       (16UL * 1024 * 1024)   /* 16 MiB */
 #define FILL_PATTERN    0xAB
-#define VMEM_DEV        "/dev/vmem"
+#define VMEM_DEV        "/dev/vmemIntel"
 #define VMEM_KO         "../vmem.ko"
 
 /* Known BDF / BAR2 for the two e211 dGPUs on this server */
@@ -129,7 +129,7 @@ static int ensure_vmem_loaded(void)
 {
     if (access(VMEM_DEV, F_OK) == 0)
         return 0;
-    printf(INFO " /dev/vmem not found, loading %s ...\n", VMEM_KO);
+    printf(INFO " /dev/vmemIntel not found, loading %s ...\n", VMEM_KO);
     if (access(VMEM_KO, F_OK) != 0) {
         fprintf(stderr, FAIL " %s not found. Build first: cd .. && make\n", VMEM_KO);
         return -1;
@@ -141,7 +141,7 @@ static int ensure_vmem_loaded(void)
         fprintf(stderr, FAIL " insmod failed (rc=%d)\n", r);
         return -1;
     }
-    printf(PASS " vmem module loaded, /dev/vmem ready\n");
+    printf(PASS " vmem module loaded, /dev/vmemIntel ready\n");
     return 0;
 }
 
