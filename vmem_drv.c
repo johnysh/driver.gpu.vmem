@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * vmem_drv.c - vMem Linux kernel driver (v1.0)
+ * vmem_drv.c - vMem Linux kernel driver (v2.0)
  *
- * Changes from v0.1:
- *   - REGISTER_EP / CLOSE_IPC_FD removed
- *   - GET_IPC_FD: consumer BDF per-call (no global ep_table)
- *   - GET_PFN_OFFSET_LIST: userspace pointer, dynamic count; always BAR-relative
- *   - VERSION + IDENTIFY_DMABUF added
+ * Device: /dev/vmemIntel
+ *
+ * v2.0 changes:
+ *   - OPEN_IPC_HANDLE  replaces GET_PFN_OFFSET_LIST (same logic, new name)
+ *   - GET_IPC_HANDLE   replaces GET_IPC_FD: takes {node_id, gpu_id, offsets}
+ *                      PA synthesis now done in KMD via vmem_astera_lookup()
+ *   - PUT_IPC_HANDLE   replaces CLOSE_IPC_FD (peer teardown, same logic)
+ *   - CLOSE_IPC_HANDLE replaces PUT_IPC_FD   (origin teardown, same logic)
+ *   - VERSION + IDENTIFY_DMABUF unchanged
  */
 
 #include <linux/module.h>
@@ -20,13 +24,14 @@
 #include <linux/pci.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
-#include <linux/fdtable.h>   /* close_fd() */
+#include <linux/fdtable.h>
 
 #include "include/vmem_ioctl.h"
 #include "vmem_dmabuf.h"
+#include "vmem_astera.h"
 
 #define VMEM_DRV_NAME    "vmemIntel"
-#define VMEM_DRV_VERSION "1.0.0"
+#define VMEM_DRV_VERSION "2.0.0"
 
 /* ── IOCTL handlers ───────────────────────────────────────── */
 
@@ -43,40 +48,45 @@ static long vmem_ioctl_version(struct file *filp, unsigned long arg)
 	return 0;
 }
 
-static long vmem_ioctl_get_pfn(struct file *filp, unsigned long arg)
+/* Origin: attach GPU dma-buf, extract BAR-relative scatter offsets */
+static long vmem_ioctl_open_ipc_handle(struct file *filp, unsigned long arg)
 {
 	struct vmem_file_priv *priv = filp->private_data;
-	struct vmem_ioctl_get_pfn_arg karg;
+	struct vmem_ioctl_open_ipc_handle_arg karg;
 	int ret;
 
 	if (copy_from_user(&karg, (void __user *)arg, sizeof(karg)))
 		return -EFAULT;
 
-	ret = vmem_parse_dmabuf(priv,
-				karg.fd,
-				karg.bus, karg.device, karg.function,
-				(struct vmem_pfn_entry __user *)(uintptr_t)
+	ret = vmem_open_ipc_handle(priv,
+				   karg.fd,
+				   karg.bus, karg.device, karg.function,
+				   (struct vmem_pfn_entry __user *)(uintptr_t)
 					karg.entries_ptr,
-				&karg.count);
+				   &karg.count);
 
-	/* Always write back count (actual or required for ENOSPC retry) */
+	/* Always write back count (actual or required for -ENOSPC retry) */
 	if (copy_to_user((void __user *)arg, &karg, sizeof(karg)))
 		return -EFAULT;
 
 	return ret;
 }
 
-static long vmem_ioctl_get_ipc_fd(struct file *filp, unsigned long arg)
+/*
+ * Peer: Method 1 - receive {node_id, gpu_id, BAR-relative offsets},
+ * call vmem_astera_lookup() in-kernel to compute PAs, build pseudo dma-buf.
+ */
+static long vmem_ioctl_get_ipc_handle(struct file *filp, unsigned long arg)
 {
-	struct vmem_ioctl_get_ipc_fd_arg karg;
+	struct vmem_ioctl_get_ipc_handle_arg karg;
 	struct dma_buf *dmabuf;
 	int fd;
 
 	if (copy_from_user(&karg, (void __user *)arg, sizeof(karg)))
 		return -EFAULT;
 
-	/* entries[i].offset must be absolute PAs (daemon: vFE_bar_base + offset) */
-	dmabuf = vmem_create_dmabuf(
+	dmabuf = vmem_get_ipc_handle_method1(
+		karg.node_id, karg.gpu_id,
 		(struct vmem_pfn_entry __user *)(uintptr_t)karg.entries_ptr,
 		karg.count);
 	if (IS_ERR(dmabuf))
@@ -97,36 +107,31 @@ static long vmem_ioctl_get_ipc_fd(struct file *filp, unsigned long arg)
 	return 0;
 }
 
-static long vmem_ioctl_close_ipc_fd(struct file *filp, unsigned long arg)
+/* Peer: destroy the pseudo dma-buf fd */
+static long vmem_ioctl_put_ipc_handle(struct file *filp, unsigned long arg)
 {
-	struct vmem_ioctl_close_ipc_fd_arg karg;
+	struct vmem_ioctl_put_ipc_handle_arg karg;
 
 	if (copy_from_user(&karg, (void __user *)arg, sizeof(karg)))
 		return -EFAULT;
 
-	/*
-	 * Close the fake dma-buf fd on behalf of the caller.
-	 * Standard userspace path is close(fd), but providing this ioctl
-	 * lets the driver manage fd lifetime in coordination with the UMD.
-	 */
 	return close_fd(karg.fd);
 }
 
-static long vmem_ioctl_put_ipc_fd(struct file *filp, unsigned long arg)
+/* Origin: release persistent soft-pin */
+static long vmem_ioctl_close_ipc_handle(struct file *filp, unsigned long arg)
 {
 	struct vmem_file_priv *priv = filp->private_data;
-	struct vmem_ioctl_put_ipc_fd_arg karg;
+	struct vmem_ioctl_close_ipc_handle_arg karg;
 	int ret;
 
 	if (copy_from_user(&karg, (void __user *)arg, sizeof(karg)))
 		return -EFAULT;
 
-	ret = vmem_release_pin(priv, karg.fd);
+	ret = vmem_close_ipc_handle(priv, karg.fd);
 	if (ret)
-		pr_warn("vmem: PUT_IPC_FD fd=%d: no matching pin (%d)\n",
+		pr_warn("vmem: CLOSE_IPC_HANDLE fd=%d: no matching pin (%d)\n",
 			karg.fd, ret);
-	else
-		pr_debug("vmem: PUT_IPC_FD fd=%d: pin released\n", karg.fd);
 	return ret;
 }
 
@@ -159,14 +164,14 @@ static long vmem_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case VMEM_IOCTL_VERSION:
 		return vmem_ioctl_version(filp, arg);
-	case VMEM_IOCTL_GET_PFN_OFFSET_LIST:
-		return vmem_ioctl_get_pfn(filp, arg);
-	case VMEM_IOCTL_GET_IPC_FD:
-		return vmem_ioctl_get_ipc_fd(filp, arg);
-	case VMEM_IOCTL_CLOSE_IPC_FD:
-		return vmem_ioctl_close_ipc_fd(filp, arg);
-	case VMEM_IOCTL_PUT_IPC_FD:
-		return vmem_ioctl_put_ipc_fd(filp, arg);
+	case VMEM_IOCTL_OPEN_IPC_HANDLE:
+		return vmem_ioctl_open_ipc_handle(filp, arg);
+	case VMEM_IOCTL_GET_IPC_HANDLE:
+		return vmem_ioctl_get_ipc_handle(filp, arg);
+	case VMEM_IOCTL_PUT_IPC_HANDLE:
+		return vmem_ioctl_put_ipc_handle(filp, arg);
+	case VMEM_IOCTL_CLOSE_IPC_HANDLE:
+		return vmem_ioctl_close_ipc_handle(filp, arg);
 	case VMEM_IOCTL_IDENTIFY_DMABUF:
 		return vmem_ioctl_identify_dmabuf(filp, arg);
 	default:
@@ -185,7 +190,6 @@ static int vmem_open(struct inode *inode, struct file *filp)
 	INIT_LIST_HEAD(&priv->import_pins);
 	mutex_init(&priv->pin_lock);
 	filp->private_data = priv;
-	pr_debug("vmem: open\n");
 	return 0;
 }
 
@@ -199,7 +203,6 @@ static int vmem_release(struct inode *inode, struct file *filp)
 		kfree(priv);
 		filp->private_data = NULL;
 	}
-	pr_debug("vmem: close\n");
 	return 0;
 }
 
@@ -234,6 +237,7 @@ static int __init vmem_init(void)
 
 	pr_info("vmem: driver v%s loaded, /dev/%s (minor %d)\n",
 		VMEM_DRV_VERSION, VMEM_DRV_NAME, vmem_misc.minor);
+	pr_info("vmem: GET_IPC_HANDLE returns -ENOSYS until astera_vfe.ko registers\n");
 	return 0;
 }
 
@@ -248,6 +252,6 @@ module_exit(vmem_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Intel Corporation");
-MODULE_DESCRIPTION("vMem: PCIe switch cross-node GPU dma-buf translator");
+MODULE_DESCRIPTION("vMem: PCIe switch cross-node GPU dma-buf translator (Method 1)");
 MODULE_VERSION(VMEM_DRV_VERSION);
 MODULE_IMPORT_NS("DMA_BUF");

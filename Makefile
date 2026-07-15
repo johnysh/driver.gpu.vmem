@@ -8,7 +8,7 @@
 #   make info         - show module info
 
 obj-m += vmem.o
-vmem-objs := vmem_drv.o vmem_dmabuf.o
+vmem-objs := vmem_drv.o vmem_dmabuf.o vmem_astera.o
 
 # Extra cflags: include the local include/ directory for vmem_ioctl.h
 ccflags-y := -I$(src) -DDEBUG
@@ -29,7 +29,7 @@ install: all
 		sudo rmmod vmem; \
 	fi
 	sudo insmod vmem.ko
-	@echo "vmem loaded. Device: $$(ls -la /dev/vmem)"
+	@echo "vmem loaded. Device: $$(ls -la /dev/vmem*)"
 
 uninstall:
 	@if lsmod | grep -q "^vmem "; then \
