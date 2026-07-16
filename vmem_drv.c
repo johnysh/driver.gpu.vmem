@@ -104,7 +104,7 @@ static long vmem_ioctl_get_dmabuf(struct file *filp, unsigned long arg)
 
 	karg.fd = fd;
 	if (copy_to_user((void __user *)arg, &karg, sizeof(karg))) {
-		pr_warn("vmem: copy_to_user failed after fd=%d installed\n", fd);
+		vmem_put_dmabuf(priv, fd);
 		return -EFAULT;
 	}
 	return 0;

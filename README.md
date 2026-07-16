@@ -119,7 +119,7 @@ Include `include/vmem_ioctl.h`. Magic: `'V'` (0x56). Version: **3.1.0**.
   -> KMD returns -ENOSPC, count = required N
 Allocate: entries = malloc(N * sizeof(vmem_pfn_entry))
 2nd call: count = N, entries_ptr = entries
-  -> KMD fills entries[i].{offset, size}
+  -> KMD fills entries[i].{addr, size}
 ```
 
 ### Key Structures
@@ -137,7 +137,8 @@ struct vmem_ioctl_open_dmabuf_arg {
     __s32  fd;           /* in:  GPU dma-buf fd */
     __u8   bus, device, function, pad2;  /* in: GPU BDF */
     __u32  count;        /* in/out: capacity / actual count (-ENOSPC retry) */
-    __u32  pad;
+    __u32  page_size;    /* out: PAGE_SIZE */
+    __u64  total_size;   /* out: total bytes across all chunks */
     __u64  entries_ptr;  /* in: userspace ptr -> vmem_pfn_entry[] output */
 };
 
