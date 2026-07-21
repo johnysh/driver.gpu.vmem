@@ -73,8 +73,8 @@ driver.gpu.vmem/
 ├── Makefile
 ├── README.md
 └── test/
-    ├── vmem_test.c         Ioctl smoke test (VERSION, GET/PUT_DMABUF)
-    └── vmem_gpu_test.c     Full GPU integration test (Level Zero)
+    ├── README.md           Test directory documentation
+    └── vmem_test.c         Ioctl smoke test (VERSION, GET/PUT_DMABUF)
 ```
 
 ---
@@ -286,11 +286,17 @@ MODULE_LICENSE("GPL");
 
 ## Changelog
 
+### v3.1.1
+
+- **`vmem.h` C++ linkage fix**: `extern C {` corrected to `extern "C" {`; C++ consumers now compile correctly
+- **GET_DMABUF fd cleanup**: `copy_to_user` failure in `vmem_ioctl_get_dmabuf` now calls `vmem_put_dmabuf()` to release the installed fd instead of leaking it until the vmem fd is closed
+- **`vmem_gpu_test.c` removed**: stale v3.0 integration test (used obsolete ioctls and `.offset` field); replaced by `umd.gpu.vmem/test/vmem_p2p_test.c` which uses the libvmem API
+
 ### v3.1.0
 
 - **mem_pfn_entry.offset renamed to .addr**: OPEN_DMABUF now returns absolute physical addresses; UMD computes BAR-relative offsets (offset = abs_pa - gpu_bar2_base)
 - **KMD no longer reads GPU BAR2 base** (removed from kernel; UMD reads sysfs)
-- **OPEN_DMABUF arg gains page_size and otal_size output fields**
+- **OPEN_DMABUF arg gains page_size and total_size output fields**
 - Version bump to 3.1.0
 
 ### v3.0.0

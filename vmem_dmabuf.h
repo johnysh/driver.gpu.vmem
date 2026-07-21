@@ -12,7 +12,8 @@
 
 /*
  * vmem_buf: private context for the MMIO-backed pseudo dma-buf (peer side).
- * entries[i].addr = absolute peer-side PA (vfe_base + bar_relative_offset)
+ * entries[i].addr = absolute peer-side PA (TARGET PA, translated by daemon Layer A
+ * via Astera COSMOS SDK before being passed to KMD)
  * entries[i].size = byte length
  */
 struct vmem_buf {
@@ -46,7 +47,7 @@ struct vmem_file_priv {
  * vmem_open_dmabuf_fd - P2P attach, walk sg_table, return absolute PAs.
  *
  * KMD returns entries[i].addr = sg_dma_address(sg)  (absolute physical address).
- * UMD computes: offset[i] = entries[i].addr - gpu_bar2_base
+ * UMD forwards abs PAs to daemon as-is (no offset computation).
  *
  * @page_size:  out: PAGE_SIZE (4096)
  * @total_size: out: total bytes across all chunks
@@ -60,8 +61,8 @@ int  vmem_close_dmabuf(struct vmem_file_priv *priv, int orig_fd);
 void vmem_import_pins_cleanup(struct vmem_file_priv *priv);
 
 /* ── Peer side ───────────────────────────────────────────── */
+/* entries[i].addr = pre-translated absolute PA from daemon Layer A (COSMOS SDK). */
 int  vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
-			u32 node_id, u32 gpu_id,
 			struct vmem_pfn_entry __user *entries_ptr,
 			u32 count);
 int  vmem_put_dmabuf(struct vmem_file_priv *priv, int exported_fd);

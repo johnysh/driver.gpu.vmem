@@ -1,27 +1,25 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 /*
- * vmem_ioctl.h - vMem driver UAPI (v3.1)
+ * vmem_ioctl.h - vMem driver UAPI (v4.0)
  *
- * Method 1: address translation in KMD via Astera vFE kernel API.
- * Every object is identified by a dma-buf fd; no opaque handles.
+ * Method 2: pass-through only. KMD and UMD do NOT perform address
+ * translation. The IMEMLINK daemon (Layer A) calls the Astera COSMOS SDK
+ * in userspace to translate origin GPU BAR-relative offsets to peer-side
+ * absolute physical addresses (TARGET PAs). The translated PAs are passed
+ * down to the peer UMD, which forwards them verbatim to KMD.
  *
  * Origin side:
  *   VMEM_IOCTL_OPEN_DMABUF   -- KMD attaches GPU dma-buf, walks sg_table,
  *                               returns ABSOLUTE physical addresses (abs PAs)
- *                               per scatter chunk.  UMD then computes:
- *                                 offset[i] = entries[i].addr - gpu_bar2_base
- *                               and forwards {offset list, node_id, gpu_id}
- *                               to the peer over the control channel.
+ *                               per scatter chunk. UMD forwards these abs PAs
+ *                               to the IMEMLINK daemon as-is (no BAR subtraction).
  *   VMEM_IOCTL_CLOSE_DMABUF  -- release soft-pin (keyed by opened dma-buf fd)
  *
- * Peer side (Method 1: in-kernel PA synthesis via Astera vFE):
- *   VMEM_IOCTL_GET_DMABUF    -- input: {node_id, gpu_id, BAR-relative offset list}
- *                               KMD: astera_lookup(node_id, gpu_id)
- *                                    -> (dbdf, bar, index)
- *                                    -> base = pci_resource_start(dbdf, bar)
- *                                           + index * 32 GB
- *                                    -> PA'[i] = base + entries[i].addr
- *                                    -> build MMIO dma-buf -> fd
+ * Peer side (Method 2: pass-through, daemon does translation via COSMOS SDK):
+ *   VMEM_IOCTL_GET_DMABUF    -- input: {count, abs_pa entries[]}
+ *                               KMD: build MMIO dma-buf from pre-translated abs PAs.
+ *                               No astera_lookup in KMD. Translation was done by
+ *                               daemon Layer A via cosmos_query_vfe().
  *   VMEM_IOCTL_PUT_DMABUF    -- destroy pseudo dma-buf fd
  *
  * Utilities:
@@ -41,8 +39,8 @@
 
 #define VMEM_MAGIC 'V'
 
-#define VMEM_DRV_VERSION_MAJOR 3
-#define VMEM_DRV_VERSION_MINOR 1
+#define VMEM_DRV_VERSION_MAJOR 4
+#define VMEM_DRV_VERSION_MINOR 0
 #define VMEM_DRV_VERSION_PATCH 0
 
 #define VMEM_MAX_PFN_ENTRIES 4096
@@ -50,19 +48,20 @@
 /**
  * struct vmem_pfn_entry - one scatter chunk descriptor
  *
- * Dual-use: the meaning of @addr differs by ioctl context.
- *
  * OPEN_DMABUF output (origin side, filled by KMD):
  *   @addr = absolute physical address of the scatter chunk
- *           (sg_dma_address(sg), which equals PA when IOMMU is off)
- *   UMD computes: offset[i] = addr[i] - gpu_bar2_base
+ *           (sg_dma_address(sg), which equals PA when IOMMU is off).
+ *           UMD forwards this value to the daemon without modification.
  *
- * GET_DMABUF input (peer side, filled by UMD):
- *   @addr = BAR-relative byte offset forwarded from origin
- *           (offset[i] = abs_pa[i] - gpu_bar2_base)
- *   KMD computes: PA'[i] = vfe_base + addr[i]
+ * GET_DMABUF input (peer side, filled by UMD with daemon-provided value):
+ *   @addr = absolute peer-side physical address (TARGET PA) already
+ *           translated by daemon Layer A via Astera COSMOS SDK:
+ *             cosmos_query_vfe(node_id, gpu_id) -> {vfe_dbdf, bar_id, slot}
+ *             PA'[i] = pci_resource_start(vfe_dbdf, bar_id)
+ *                      + slot * 32 GiB + bar_offset[i]
+ *           KMD uses this value directly without further translation.
  *
- * @addr:  absolute physical address (OPEN) or BAR-relative offset (GET)
+ * @addr:  absolute physical address (abs PA origin, or translated PA' on peer)
  * @size:  page-aligned byte length of this chunk
  */
 struct vmem_pfn_entry {
@@ -88,10 +87,9 @@ struct vmem_ioctl_version_arg {
  * ABSOLUTE physical address in entries[i].addr.
  *
  * UMD responsibility after this call:
- *   bar2_base = read_sysfs_bar2(bus, device, function);
- *   for i in 0..count:
- *       offset[i] = entries[i].addr - bar2_base
- *   send {offset list, node_id, gpu_id} to peer over control channel.
+ *   Forward entries[i].addr (abs PAs) to the IMEMLINK daemon verbatim.
+ *   The daemon (Layer A) handles any BAR-relative normalization and stores
+ *   the descriptor in its BlobStore. No offset subtraction in UMD.
  *
  * Two-step count negotiation:
  *   Pass count=0 -> KMD returns -ENOSPC with count=required N.
@@ -117,24 +115,18 @@ struct vmem_ioctl_open_dmabuf_arg {
 };
 
 /**
- * struct vmem_ioctl_get_dmabuf_arg - VMEM_IOCTL_GET_DMABUF (Method 1)
+ * struct vmem_ioctl_get_dmabuf_arg - VMEM_IOCTL_GET_DMABUF (Method 2)
  *
- * Peer: UMD fills entries[i].addr with BAR-relative offsets received from
- * origin over the control channel.  KMD resolves the vFE endpoint and
- * synthesises absolute peer-side PAs:
- *   astera_lookup(node_id, gpu_id) -> (dbdf, bar, index)
- *   vfe_base  = pci_resource_start(dbdf, bar) + index * 32 GB
- *   PA'[i]   = vfe_base + entries[i].addr
+ * Peer: UMD fills entries[i].addr with absolute peer-side physical addresses
+ * (TARGET PAs) already translated by the IMEMLINK daemon via Astera COSMOS SDK.
+ * KMD builds the MMIO pseudo dma-buf directly from these PAs. No astera_lookup
+ * in KMD.
  *
- * @node_id:     in:  remote node id (forwarded from origin)
- * @gpu_id:      in:  remote GPU id
- * @count:       in:  number of BAR-relative offset entries
- * @entries_ptr: in:  userspace ptr -> vmem_pfn_entry[] (addr = BAR-relative)
+ * @count:       in:  number of entries
+ * @entries_ptr: in:  userspace ptr -> vmem_pfn_entry[] (addr = translated abs PA)
  * @fd:          out: pseudo dma-buf fd
  */
 struct vmem_ioctl_get_dmabuf_arg {
-	__u32  node_id;
-	__u32  gpu_id;
 	__u32  count;
 	__u32  pad;
 	__u64  entries_ptr;

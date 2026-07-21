@@ -1,7 +1,7 @@
 # Makefile for vmem kernel module (v3.0)
 # Four source files + astera stub
 obj-m += vmem.o
-vmem-objs := vmem_drv.o vmem_dmabuf.o vmem_buffer.o vmem_debugfs.o vmem_astera.o
+vmem-objs := vmem_drv.o vmem_dmabuf.o vmem_buffer.o vmem_debugfs.o
 
 ccflags-y := -I$(src) -DDEBUG
 

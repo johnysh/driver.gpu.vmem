@@ -25,7 +25,6 @@
 
 #include "include/vmem_ioctl.h"
 #include "vmem_dmabuf.h"
-#include "vmem_astera.h"
 #include "vmem_debugfs.h"
 
 #define VMEM_DRV_NAME    "vmemIntel"
@@ -97,7 +96,6 @@ static long vmem_ioctl_get_dmabuf(struct file *filp, unsigned long arg)
 		return -EFAULT;
 
 	fd = vmem_get_dmabuf_fd(priv,
-				karg.node_id, karg.gpu_id,
 				(struct vmem_pfn_entry __user *)(uintptr_t)karg.entries_ptr,
 				karg.count);
 	if (fd < 0) return fd;
@@ -201,6 +199,6 @@ module_exit(vmem_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Intel Corporation");
-MODULE_DESCRIPTION("vMem: PCIe cross-node GPU dma-buf translator (Method 1 KMD PA synthesis)");
+MODULE_DESCRIPTION("vMem KMD v4.0 (Method 2: pass-through, daemon COSMOS SDK translation)");
 MODULE_VERSION(VMEM_DRV_VERSION);
 MODULE_IMPORT_NS("DMA_BUF");

@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * vmem_dmabuf.c - vMem dma-buf operations (Method 1: KMD PA synthesis)
+ * vmem_dmabuf.c - vMem dma-buf operations (Method 2: pass-through)
+ *
+ * KMD and UMD do NOT perform address translation. The IMEMLINK daemon
+ * (Layer A) calls the Astera COSMOS SDK in userspace to translate origin GPU
+ * BAR-relative offsets to TARGET physical addresses, then passes the result
+ * down to the peer UMD, which forwards them verbatim to KMD.
  *
  * Origin side:
  *   vmem_open_dmabuf_fd()   -- P2P attach, walk sg_table, return ABSOLUTE PAs.
- *                              UMD computes: offset[i] = pa[i] - gpu_bar2_base
+ *                              UMD forwards abs PAs to daemon as-is.
  *   vmem_close_dmabuf()     -- release soft-pin: unmap -> detach -> put
  *   vmem_import_pins_cleanup() -- backstop sweep on vmem fd close / crash
  *
- * Peer side (Method 1: in-kernel PA synthesis via Astera vFE):
- *   vmem_get_dmabuf_fd()    -- astera_lookup(node_id, gpu_id) -> vfe_base
- *                              -> PA'[i] = vfe_base + entries[i].addr (BAR-relative)
- *                              -> MMIO pseudo dma-buf fd
+ * Peer side (Method 2: pass-through, translation done by daemon via COSMOS SDK):
+ *   vmem_get_dmabuf_fd()    -- take pre-translated abs PAs from UMD directly
+ *                              -> MMIO pseudo dma-buf fd (no astera_lookup)
  *   vmem_put_dmabuf()       -- remove vmem_buffer_obj, close_fd, kref_put
  *   vmem_buffers_cleanup()  -- backstop sweep of remaining exported bufs
  */
@@ -27,7 +31,6 @@
 #include <linux/fdtable.h>
 
 #include "vmem_dmabuf.h"
-#include "vmem_astera.h"
 #include "vmem_buffer.h"
 #include "vmem_debugfs.h"
 
@@ -61,9 +64,9 @@ static const struct dma_buf_attach_ops vmem_importer_ops = {
  *   Returns {abs PA, size} per chunk in entries[].addr/size
  *   Keeps attachment + sg_table alive as soft-pin.
  *
- * UMD responsibility after this call:
- *   bar2_base = sysfs_read_bar2(bus, device, function)
- *   offset[i] = entries[i].addr - bar2_base   <- BAR-relative, send to peer
+ * Daemon A responsibility after this call:
+ *   bar2_base = sysfs read or COSMOS SDK
+ *   pa_offset[i] = entries[i].addr - bar2_base  <- stored in BlobStore
  *
  * Two-step count negotiation:
  *   count=0  -> -ENOSPC, count=required N
@@ -342,91 +345,64 @@ static const struct dma_buf_ops vmem_dmabuf_ops = {
 };
 
 /* ==========================================================================
- * Peer: vmem_get_dmabuf_fd  (Method 1)
+ * Peer: vmem_get_dmabuf_fd  (Method 2: pass-through)
  * ========================================================================== */
 
 /**
- * vmem_get_dmabuf_fd - build pseudo dma-buf via in-kernel Astera vFE lookup
+ * vmem_get_dmabuf_fd - build pseudo dma-buf from pre-translated absolute PAs.
  *
- * Implements VMEM_IOCTL_GET_DMABUF (Method 1).
+ * Implements VMEM_IOCTL_GET_DMABUF (Method 2).
  *
- * UMD fills entries[i].addr with BAR-relative offsets received from origin:
- *   offset[i] = abs_pa[i] - gpu_bar2_base   (computed by origin UMD)
+ * The IMEMLINK daemon (Layer A) has already performed address translation via
+ * the Astera COSMOS SDK:
+ *   cosmos_query_vfe(node_id, gpu_id) -> {vfe_dbdf, bar_id, slot_index}
+ *   vfe_base = pci_resource_start(vfe_dbdf, bar_id) + slot_index * 32 GiB
+ *   PA'[i]   = vfe_base + bar_offset[i]
  *
- * KMD flow:
- *   1. astera_lookup(node_id, gpu_id) -> ep = {domain, bus, devfn, bar, index}
- *   2. vfe_base = pci_resource_start(dbdf, bar) + index * VMEM_VFE_WINDOW_SIZE
- *   3. PA'[i]   = vfe_base + entries[i].addr
- *   4. export MMIO pseudo dma-buf -> install fd
- *   5. allocate vmem_buffer_obj, track in priv->buffers, record in debugfs
+ * UMD passes these final absolute PAs directly. KMD does NOT call astera_lookup.
+ *
+ * @priv:        per-file state
+ * @entries_ptr: userspace ptr -> vmem_pfn_entry[] with pre-translated abs PAs
+ * @count:       number of entries
+ * Returns: pseudo dma-buf fd (>= 0) or negative errno.
  */
 int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
-		       u32 node_id, u32 gpu_id,
 		       struct vmem_pfn_entry __user *entries_ptr,
 		       u32 count)
 {
-	struct astera_vfe_ep ep;
-	struct pci_dev *pdev;
-	phys_addr_t bar_start, vfe_base;
-	struct vmem_pfn_entry *bar_entries, *pa_entries;
+	struct vmem_pfn_entry *pa_entries;
 	struct vmem_buf *vbuf;
 	struct vmem_buffer_obj *obj;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct dma_buf *dmabuf;
 	size_t total = 0;
 	u32 i;
-	int fd, ret;
+	int fd;
 
-	if (!count) return -EINVAL;
+	if (!count)
+		return -EINVAL;
 
-	/* Step 1: (node_id, gpu_id) -> vFE endpoint */
-	ret = vmem_astera_lookup(node_id, gpu_id, &ep);
-	if (ret) {
-		pr_err("vmem: get_dmabuf: astera_lookup(node=%u gpu=%u) -> %d\n",
-		       node_id, gpu_id, ret);
-		return ret;
-	}
-
-	/* Step 2: compute vFE MMIO window base */
-	pdev = pci_get_domain_bus_and_slot(ep.domain, ep.bus, ep.devfn);
-	if (!pdev) {
-		pr_err("vmem: get_dmabuf: vFE pdev not found (%04x:%02x:%02x.%u)\n",
-		       ep.domain, ep.bus, PCI_SLOT(ep.devfn), PCI_FUNC(ep.devfn));
-		return -ENODEV;
-	}
-	bar_start = pci_resource_start(pdev, ep.bar);
-	pci_dev_put(pdev);
-	if (!bar_start) {
-		pr_err("vmem: get_dmabuf: vFE BAR%u not mapped\n", ep.bar);
-		return -ENXIO;
-	}
-	vfe_base = bar_start + (phys_addr_t)ep.index * VMEM_VFE_WINDOW_SIZE;
-
-	/* Copy BAR-relative offset entries from userspace */
-	bar_entries = kvcalloc(count, sizeof(*bar_entries), GFP_KERNEL);
-	if (!bar_entries) return -ENOMEM;
-	if (copy_from_user(bar_entries, entries_ptr, count * sizeof(*bar_entries))) {
-		kvfree(bar_entries);
+	/* Copy pre-translated absolute PAs from userspace */
+	pa_entries = kvcalloc(count, sizeof(*pa_entries), GFP_KERNEL);
+	if (!pa_entries)
+		return -ENOMEM;
+	if (copy_from_user(pa_entries, entries_ptr, count * sizeof(*pa_entries))) {
+		kvfree(pa_entries);
 		return -EFAULT;
 	}
 
-	/* Step 3: translate BAR-relative offsets -> absolute peer-side PAs */
-	pa_entries = kvcalloc(count, sizeof(*pa_entries), GFP_KERNEL);
-	if (!pa_entries) { kvfree(bar_entries); return -ENOMEM; }
-
 	for (i = 0; i < count; i++) {
-		pa_entries[i].addr = (u64)(vfe_base + bar_entries[i].addr);
-		pa_entries[i].size = bar_entries[i].size;
-		total += bar_entries[i].size;
-		pr_debug("vmem: pa[%u] = 0x%llx + 0x%llx = 0x%llx size=%u\n",
-			 i, (u64)vfe_base, bar_entries[i].addr,
-			 pa_entries[i].addr, pa_entries[i].size);
+		total += pa_entries[i].size;
+		pr_debug("vmem: get_dmabuf: pa[%u] = 0x%llx size=%u\n",
+			 i, pa_entries[i].addr, pa_entries[i].size);
 	}
-	kvfree(bar_entries);
 
-	/* Step 4: build MMIO pseudo dma-buf */
+	/* Build MMIO pseudo dma-buf from pre-translated PAs */
 	vbuf = kzalloc(sizeof(*vbuf), GFP_KERNEL);
-	if (!vbuf) { kvfree(pa_entries); return -ENOMEM; }
+	if (!vbuf) {
+		kvfree(pa_entries);
+		return -ENOMEM;
+	}
 	vbuf->nr_entries = count;
 	vbuf->total_size = total;
 	vbuf->entries    = pa_entries;
@@ -445,9 +421,12 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 	}
 
 	fd = dma_buf_fd(dmabuf, O_CLOEXEC);
-	if (fd < 0) { dma_buf_put(dmabuf); return fd; }
+	if (fd < 0) {
+		dma_buf_put(dmabuf);
+		return fd;
+	}
 
-	/* Step 5: track with vmem_buffer_obj */
+	/* Track with vmem_buffer_obj */
 	obj = vmem_buffer_obj_alloc(count, total);
 	if (!obj) {
 		pr_warn("vmem: get_dmabuf: vmem_buffer_obj_alloc failed, fd=%d leaks\n", fd);
@@ -465,10 +444,11 @@ int vmem_get_dmabuf_fd(struct vmem_file_priv *priv,
 	vmem_debugfs_add_exported(obj->pid, fd, total, obj->segs, count);
 
 done:
-	pr_info("vmem: get_dmabuf: fd=%d %u entries node=%u gpu=%u vfe_base=0x%llx\n",
-		fd, count, node_id, gpu_id, (u64)vfe_base);
+	pr_info("vmem: get_dmabuf: fd=%d %u entries total=0x%zx (pass-through, no Astera lookup)\n",
+		fd, count, total);
 	return fd;
 }
+
 
 /* ==========================================================================
  * Peer: vmem_put_dmabuf
